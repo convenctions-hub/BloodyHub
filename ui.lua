@@ -10,7 +10,11 @@ local UserInputSvc = game:GetService("UserInputService")
 local CoreGui      = game:GetService("CoreGui")
 local LocalPlayer  = Players.LocalPlayer
 
-local API = _G.BloodyHub_API or {}
+local API
+repeat
+    API = _G.BloodyHub_API
+    task.wait()
+until API
 local function safeCall(fn, ...) if type(fn) == "function" then pcall(fn, ...) end end
 
 -- Чистим старое окно, если осталось
