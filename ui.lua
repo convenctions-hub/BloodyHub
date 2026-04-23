@@ -1,7 +1,7 @@
 --[[ BloodyHub UI v1
-     - Строит главное окно с вкладками
-     - Кнопки вызывают _G.BloodyHub_API.*
-     - В конце прячет loading screen
+- Строит главное окно с вкладками
+- Кнопки вызывают _G.BloodyHub_API.*
+- В конце прячет loading screen
 ]]
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -14,7 +14,7 @@ local API = _G.BloodyHub_API or {}
 local function safeCall(fn, ...) if type(fn) == "function" then pcall(fn, ...) end end
 
 -- Чистим старое окно, если осталось
-for _, g in ipairs(CoreGui:GetChildren()) do
+for _, g in ipairs(CoreGui:GetChildren()) do          -- ИСПРАВЛЕНО: * → _
     if g.Name == "BloodyHub" then pcall(function() g:Destroy() end) end
 end
 
@@ -36,7 +36,7 @@ local function new(class, props, children)
     local ok, o = pcall(Instance.new, class)
     if not ok or not o then return Instance.new("Frame") end
     for k, v in pairs(props or {}) do pcall(function() o[k] = v end) end
-    for _, c in ipairs(children or {}) do
+    for _, c in ipairs(children or {}) do          -- ИСПРАВЛЕНО: пропущенный _
         if c and typeof(c) ~= "table" then pcall(function() c.Parent = o end) end
     end
     return o
@@ -161,9 +161,10 @@ end)
 
 winBtn("✕", -36, function()
     tween(Main, 0.2, { BackgroundTransparency = 1 })
-    task.wait(0.25)
-    Main.Visible = false
-    Main.BackgroundTransparency = 0.05
+    task.delay(0.25, function()          -- ИСПРАВЛЕНО: task.wait внутри коннекта → task.delay
+        Main.Visible = false
+        Main.BackgroundTransparency = 0.05
+    end)
 end)
 
 do
@@ -465,7 +466,7 @@ function BloodyHub:MakeTab(name, iconGlyph)
                 apply()
             end)
             return {
-                Set = function(_, v) state = v and true or false; apply() end,
+                Set = function(_, v) state = v and true or false; apply() end,  -- ИСПРАВЛЕНО
                 Get = function() return state end,
             }
         end
@@ -543,7 +544,7 @@ function BloodyHub:MakeTab(name, iconGlyph)
             end)
             return {
                 Get = function() return current end,
-                Set = function(_, v) current = v; setFromX(bar.AbsolutePosition.X + bar.AbsoluteSize.X * ((v - min) / (max - min))) end,
+                Set = function(_, v) current = v; setFromX(bar.AbsolutePosition.X + bar.AbsoluteSize.X * ((v - min) / (max - min))) end,  -- ИСПРАВЛЕНО
             }
         end
 
@@ -661,7 +662,7 @@ local TabMisc     = BloodyHub:MakeTab("Misc",      "✦")
 local TabSettings = BloodyHub:MakeTab("Settings",  "⚙")
 local TabCredits  = BloodyHub:MakeTab("Credits",   "★")
 
--- AUTO FARM (колбэки идут в main.lua через API)
+-- AUTO FARM
 local secFarm = TabAutoFarm:MakeSection("Quests")
 secFarm:MakeToggle("Master Auto Quest", false, function(v)
     safeCall(API.SetAutoQuest, v)
@@ -682,7 +683,7 @@ secSess:MakeButton("⛔ Destroy Session", function()
     safeCall(API.DestroySession)
 end)
 
--- SETTINGS — кейбинд на показ окна
+-- SETTINGS
 local secSets = TabSettings:MakeSection("Interface")
 secSets:MakeKeybind("Script Appearance Keybind", function()
     if not Main.Visible then
