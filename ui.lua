@@ -60,7 +60,7 @@ local ScreenGui = new("ScreenGui", {
 local mountOk = pcall(function() ScreenGui.Parent = CoreGui end)
 if not mountOk then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
--- ==================== MAIN WINDOW (увеличено для 2-й колонки) ====================
+-- ==================== MAIN WINDOW ====================
 local WIN_W, WIN_H = 860, 440
 local Main = new("Frame", {
     Parent = ScreenGui, Name = "Main",
@@ -150,9 +150,10 @@ do
     end)
 end
 
+local SIDEBAR_W = 150
 local Sidebar = new("Frame", {
     Parent = Main, Position = UDim2.fromOffset(0,40),
-    Size = UDim2.new(0,150,1,-70), BackgroundColor3 = THEME.PANEL,
+    Size = UDim2.new(0,SIDEBAR_W,1,-70), BackgroundColor3 = THEME.PANEL,
     BorderSizePixel = 0, BackgroundTransparency = 0.15,
 })
 new("UIListLayout", { Parent = Sidebar, Padding = UDim.new(0,4),
@@ -162,8 +163,8 @@ new("UIPadding", { Parent = Sidebar,
     PaddingTop = UDim.new(0,10), PaddingBottom = UDim.new(0,10) })
 
 local Content = new("Frame", {
-    Parent = Main, Position = UDim2.fromOffset(150,40),
-    Size = UDim2.new(1,-150,1,-70), BackgroundTransparency = 1,
+    Parent = Main, Position = UDim2.fromOffset(SIDEBAR_W,40),
+    Size = UDim2.new(1,-SIDEBAR_W,1,-70), BackgroundTransparency = 1,
 })
 
 local Bottom = new("Frame", {
@@ -248,8 +249,10 @@ function BloodyHub:MakeTab(name, iconGlyph)
         ScrollBarThickness = 2, ScrollBarImageColor3 = THEME.RED,
         CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
     })
+    -- Горизонтальные отступы страницы: 10px с каждой стороны
+    local PAGE_PAD = 10
     new("UIPadding", { Parent = page,
-        PaddingLeft = UDim.new(0,14), PaddingRight = UDim.new(0,14),
+        PaddingLeft = UDim.new(0,PAGE_PAD), PaddingRight = UDim.new(0,PAGE_PAD),
         PaddingTop = UDim.new(0,0), PaddingBottom = UDim.new(0,12) })
     makeHeader(page, name)
     local body = new("Frame", {
@@ -262,10 +265,14 @@ function BloodyHub:MakeTab(name, iconGlyph)
     table.insert(Tabs, tab)
     if #Tabs == 1 then setActiveTab(tab) end
 
-    local function makeSectionRaw(self, title, col)
+    -- Зазор между двумя колонками
+    local COL_GAP = 8
+
+    local function makeSectionRaw(self, title)
         local section = new("Frame", {
             Parent = body,
-            Size = UDim2.new(col or 0.5, -6, 0, 40),
+            -- Размер задаётся снаружи (в MakeSection)
+            Size = UDim2.new(1, 0, 0, 40),
             BackgroundColor3 = THEME.PANEL_ALT, BackgroundTransparency = 0.2,
             BorderSizePixel = 0, AutomaticSize = Enum.AutomaticSize.Y,
             LayoutOrder = #self.Sections + 1,
@@ -423,7 +430,6 @@ function BloodyHub:MakeTab(name, iconGlyph)
             }
         end
 
-        -- ==================== CUSTOM RAID DROPDOWN ====================
         function sec:MakeRaidDropdown(options, callback)
             local SELECTED_TEXT = "Select Raid"
             local current = nil
@@ -434,7 +440,6 @@ function BloodyHub:MakeTab(name, iconGlyph)
                 ClipsDescendants = false,
             })
 
-            -- Кнопка-заголовок выпадашки
             local dropBtn = new("TextButton", {
                 Parent = container, AutoButtonColor = false,
                 Size = UDim2.new(1,0,0,28),
@@ -443,7 +448,6 @@ function BloodyHub:MakeTab(name, iconGlyph)
                 Text = SELECTED_TEXT.."  ▾", ZIndex = 5,
             }, { corner(5), stroke(THEME.STROKE,1,0.2) })
 
-            -- Список вариантов
             local listFrame = new("Frame", {
                 Parent = container, Visible = false,
                 Position = UDim2.new(0,0,1,4),
@@ -522,29 +526,42 @@ function BloodyHub:MakeTab(name, iconGlyph)
         return sec
     end
 
+    -- UIListLayout для вертикального стека строк (rows)
     new("UIListLayout", { Parent=body, Padding=UDim.new(0,12),
         SortOrder=Enum.SortOrder.LayoutOrder })
     body.AutomaticSize = Enum.AutomaticSize.Y
 
     local pendingRow
     function tab:MakeSection(title)
+        -- Создаём новую строку каждые 2 секции
         if not pendingRow or (pendingRow:GetAttribute("count") or 0) >= 2 then
             pendingRow = new("Frame", {
                 Parent=body, BackgroundTransparency=1,
+                -- Высота подстраивается автоматически
                 Size=UDim2.new(1,0,0,10), AutomaticSize=Enum.AutomaticSize.Y,
                 LayoutOrder=#body:GetChildren(),
             })
             new("UIListLayout", {
-                Parent=pendingRow, FillDirection=Enum.FillDirection.Horizontal,
-                Padding=UDim.new(0,12), VerticalAlignment=Enum.VerticalAlignment.Top,
+                Parent=pendingRow,
+                FillDirection=Enum.FillDirection.Horizontal,
+                -- Зазор между двумя колонками
+                Padding=UDim.new(0,COL_GAP),
+                VerticalAlignment=Enum.VerticalAlignment.Top,
+                SortOrder=Enum.SortOrder.LayoutOrder,
             })
             pendingRow:SetAttribute("count", 0)
         end
         pendingRow:SetAttribute("count", (pendingRow:GetAttribute("count") or 0) + 1)
+
         local sec = makeSectionRaw(self, title)
         local section = self.Sections[#self.Sections]
         section.Parent = pendingRow
-        section.Size = UDim2.new(0.5,-6,0,0)
+
+        -- Каждая колонка занимает ровно половину ширины строки минус половина зазора
+        -- UDim2.new(0.5, -COL_GAP/2, 0, 0) даёт: 2*(0.5*W - GAP/2) + GAP = W
+        section.Size = UDim2.new(0.5, -math.ceil(COL_GAP/2), 0, 0)
+        section.AutomaticSize = Enum.AutomaticSize.Y
+
         return sec
     end
 
