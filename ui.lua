@@ -44,7 +44,9 @@ end
 local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r or 6) }) end
 local function stroke(col, t, trans)
     return new("UIStroke", {
-        Color = col or THEME.STROKE, Thickness = t or 1, Transparency = trans or 0,
+        Color = col or THEME.STROKE,
+        Thickness = t or 1,
+        Transparency = trans or 0,
         ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     })
 end
