@@ -2,7 +2,7 @@
      - Выставляет _G.BloodyHub_API для ui.lua
      - В конце подгружает ui.lua через loadstring
 ]]
-local UI_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/ui.lua"
+local UI_URL = "https://raw.githubusercontent.com/conventions-hub/BloodyHub/main/ui.lua"
 
 local HttpService   = game:GetService("HttpService")
 local Players       = game:GetService("Players")
