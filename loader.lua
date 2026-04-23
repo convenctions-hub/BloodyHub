@@ -1,5 +1,5 @@
 --[[ BloodyHub loader v1 ]]
-local BASE = "https://raw.githubusercontent.com/convenсtions-hub/BloodyHub/main/"
+local BASE = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/"
 
 local function fetch(name)
     local ok, src = pcall(function()
