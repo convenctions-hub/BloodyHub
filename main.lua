@@ -1,6 +1,6 @@
 --[[ BloodyHub main logic v1
-     - Выставляет _G.BloodyHub_API для ui.lua
-     - В конце подгружает ui.lua через loadstring
+- Выставляет _G.BloodyHub_API для ui.lua
+- В конце подгружает ui.lua через loadstring
 ]]
 local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
 
@@ -30,6 +30,7 @@ _G.AutoBlock           = true
 _G.HitboxExtender      = false
 _G.NoCooldown          = true
 _G.HitboxSize          = 3
+_G.KillSnapDepth       = _G.KillSnapDepth or 5   -- глубина снапа под моба (регулируется слайдером из ui.lua)
 
 -- Чистим старый лог, если есть
 for _, g in ipairs(CoreGui:GetChildren()) do
@@ -97,7 +98,7 @@ local function getQuestInfo()
         for name, info in pairs(quest.Kills) do
             local needed, current
             if type(info) == "table" then
-                needed = info.Needed or info.needed or 1
+                needed  = info.Needed  or info.needed  or 1
                 current = info.Current or info.current or 0
             elseif type(info) == "number" then
                 needed = math.huge; current = info
@@ -161,8 +162,8 @@ end
 local function forceUnlock()
     setGhost(false)
     local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
     if hrp then hrp.Anchored = false end
     if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end) end
 end
@@ -208,11 +209,10 @@ local function getNpcHRP(npcObj)
     return nil
 end
 
--- ==================== SNAP UNDER NPC ====================
-local UNDER_OFFSET = 20
+-- ==================== SNAP UNDER MOB (только для убийств) ====================
 local function makeUnderCFrame(npcHRP)
     local p = npcHRP.Position
-    return CFrame.new(p.X, p.Y - UNDER_OFFSET, p.Z)
+    return CFrame.new(p.X, p.Y - (_G.KillSnapDepth or 5), p.Z)
         * CFrame.Angles(math.pi / 2, 0, 0)
 end
 
@@ -222,7 +222,7 @@ local function startSnapLoop(hrp, npcHRP)
     setGhost(true)
     hrp.Anchored = true
     hrp.CFrame = makeUnderCFrame(npcHRP)
-    Log(string.format("SNAP UNDER: Y=%.1f", npcHRP.Position.Y - UNDER_OFFSET),
+    Log(string.format("SNAP UNDER MOB: depth=%.1f", _G.KillSnapDepth or 5),
         Color3.fromRGB(0, 255, 200))
     local conn = RunService.Heartbeat:Connect(function()
         if not active then return end
@@ -306,8 +306,8 @@ local function flyTo(getTargetPos, arriveDist, isCancelled)
         local delta = targetPos - cur
         local dist  = delta.Magnitude
         if dist <= arriveDist then done = true; return end
-        local step    = math.min(_G.FlySpeed * dt, dist)
-        local newPos  = cur + delta.Unit * step
+        local step   = math.min(_G.FlySpeed * dt, dist)
+        local newPos = cur + delta.Unit * step
         local flatDir = Vector3.new(delta.X, 0, delta.Z)
         if flatDir.Magnitude > 0.05 then
             hrp.CFrame = CFrame.new(newPos, newPos + flatDir)
@@ -317,7 +317,7 @@ local function flyTo(getTargetPos, arriveDist, isCancelled)
     end)
     local t0 = os.clock()
     while not done and not _G.BS_Dead and _G.AutoQuest_Enabled do
-        if os.clock() - t0 > 25 then Log("FLY TIMEOUT", Color3.fromRGB(255,120,0)); break end
+        if os.clock() - t0 > 25 then Log("FLY TIMEOUT", Color3.fromRGB(255, 120, 0)); break end
         task.wait()
     end
     conn:Disconnect()
@@ -344,19 +344,19 @@ local function clickDialogOption()
     return false
 end
 
--- ==================== TALK / KILL LOGIC ====================
+-- ==================== TALK LOGIC (летим к NPC обычно, без snap) ====================
 local Talking, Killing = false, false
 local CurrentTarget = nil
 
 local function doTalkQuest(targetName, sessionId)
     if Talking then return end
     Talking = true
-    local stopSnap = nil
     local ok, err = pcall(function()
         local cq = LocalPlayer:FindFirstChild("PlayerData")
             and LocalPlayer.PlayerData:FindFirstChild("SlotData")
             and LocalPlayer.PlayerData.SlotData:FindFirstChild("CurrentQuests")
         local oldValue = cq and cq.Value or ""
+
         local _, npcObj = findNpcByBillboard(targetName)
         if not npcObj then
             Log("NPC NOT FOUND: [" .. targetName .. "]", Color3.fromRGB(255, 50, 50))
@@ -369,10 +369,22 @@ local function doTalkQuest(targetName, sessionId)
         end
         local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
+
         Log("TALK -> " .. targetName, Color3.fromRGB(0, 200, 255))
-        stopSnap = startSnapLoop(hrp, npcHRP)
-        task.wait(0.2)
+
+        -- Летим к NPC обычно (НЕ снапаемся под него — он квестгивер)
+        flyTo(function()
+            if not npcHRP or not npcHRP.Parent then return nil end
+            return npcHRP.Position
+        end, 8, function()
+            return _G.QuestSessionId ~= sessionId
+        end)
+        forceUnlock()
+
         if _G.QuestSessionId ~= sessionId then return end
+        task.wait(0.2)
+
+        -- Жмём proximity prompt
         local activated = false
         for _, v in ipairs(workspace:GetDescendants()) do
             if v:IsA("ProximityPrompt") and v.Enabled then
@@ -386,30 +398,30 @@ local function doTalkQuest(targetName, sessionId)
                 end
             end
         end
-        if not activated then Log("NO PROMPT — dialog fallback", Color3.fromRGB(255,150,0)) end
+        if not activated then Log("NO PROMPT — dialog fallback", Color3.fromRGB(255, 150, 0)) end
+
         if _G.AutoDialog_Enabled then
             task.wait(0.5); clickDialogOption()
             task.wait(0.3); clickDialogOption()
             task.wait(0.3); clickDialogOption()
         end
+
         local t0 = os.clock()
         while os.clock() - t0 < 6 do
             if cq and cq.Value ~= oldValue then
-                Log("QUEST UPDATED ✓", Color3.fromRGB(0,255,150)); break
+                Log("QUEST UPDATED ✓", Color3.fromRGB(0, 255, 150)); break
             end
             task.wait(0.1)
         end
-        if stopSnap then stopSnap(); stopSnap = nil end
-        forceUnlock()
     end)
     Talking = false
-    if stopSnap then pcall(stopSnap) end
     if not ok then
         Log("TALK ERR: " .. tostring(err), Color3.fromRGB(255, 0, 0))
         forceUnlock()
     end
 end
 
+-- ==================== KILL LOGIC (летим к мобу, снапаемся под него при атаке) ====================
 local function doKillLoop(targetName, sessionId)
     if Killing then return end
     Killing = true
@@ -427,20 +439,26 @@ local function doKillLoop(targetName, sessionId)
                     task.wait(1); continue
                 end
             end
+
             local quest = getQuestInfo()
             if not quest or quest.type ~= "kill"
                 or quest.target:lower() ~= targetName:lower() then
                 Log("KILL DONE ✓", Color3.fromRGB(0, 255, 150)); break
             end
+
             local mob = CurrentTarget
             if not mob or not mob.Parent then CurrentTarget = nil; continue end
             local mobHRP = mob:FindFirstChild("HumanoidRootPart")
             if not mobHRP then CurrentTarget = nil; continue end
+
             local char = LocalPlayer.Character
             local hrp  = char and char:FindFirstChild("HumanoidRootPart")
             if not hrp then task.wait(0.5); continue end
+
             local dist = (hrp.Position - mobHRP.Position).Magnitude
+
             if dist > 5 then
+                -- Летим к мобу
                 flyTo(function()
                     if not mob or not mob.Parent then return nil end
                     local r = mob:FindFirstChild("HumanoidRootPart")
@@ -450,7 +468,10 @@ local function doKillLoop(targetName, sessionId)
                 end)
                 forceUnlock()
             else
+                -- Снапаемся ПОД моба и бьём
+                local stopSnap = startSnapLoop(hrp, mobHRP)
                 local attackStart = os.clock()
+
                 while _G.AutoQuest_Enabled and _G.QuestSessionId == sessionId
                     and not _G.BS_Dead and mob and mob.Parent do
                     local mh = mob:FindFirstChildOfClass("Humanoid")
@@ -458,7 +479,6 @@ local function doKillLoop(targetName, sessionId)
                     local hr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if not hr then break end
                     if (hr.Position - mobHRP.Position).Magnitude > 8 then break end
-                    hr.CFrame = uprightLookAt(hr.Position, mobHRP.Position)
                     doM1()
                     task.wait(_G.AttackDelay or 0.08)
                     if os.clock() - attackStart > 60 then
@@ -466,6 +486,9 @@ local function doKillLoop(targetName, sessionId)
                         CurrentTarget = nil; break
                     end
                 end
+
+                stopSnap()
+                forceUnlock()
             end
         end
     end)
@@ -609,7 +632,7 @@ end)
 _G.BloodyHub_API = {
     Log = Log,
 
-    -- Toggles (вызываются из ui.lua при клике)
+    -- Toggles
     SetAutoQuest = function(v)
         _G.AutoQuest_Enabled = v and true or false
         if v then
@@ -618,15 +641,16 @@ _G.BloodyHub_API = {
             Talking = false; Killing = false
         end
     end,
-    SetAutoDialog = function(v) _G.AutoDialog_Enabled = v and true or false end,
-    SetESP        = function(v) _G.ESP_Enabled = v and true or false end,
+    SetAutoDialog   = function(v) _G.AutoDialog_Enabled = v and true or false end,
+    SetESP          = function(v) _G.ESP_Enabled = v and true or false end,
 
-    -- Sliders / misc
-    SetFlySpeed    = function(v) _G.FlySpeed = tonumber(v) or _G.FlySpeed end,
-    SetAttackDelay = function(v) _G.AttackDelay = tonumber(v) or _G.AttackDelay end,
+    -- Sliders
+    SetFlySpeed     = function(v) _G.FlySpeed = tonumber(v) or _G.FlySpeed end,
+    SetAttackDelay  = function(v) _G.AttackDelay = tonumber(v) or _G.AttackDelay end,
+    SetKillSnapDepth = function(v) _G.KillSnapDepth = tonumber(v) or _G.KillSnapDepth end,
 
     -- Session
-    DestroySession = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
+    DestroySession  = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
 }
 
 Log("BloodyHub v82 LOADED", Color3.fromRGB(0, 255, 255))
