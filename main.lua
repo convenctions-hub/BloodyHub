@@ -26,10 +26,9 @@ _G.KillSnapDepth       = _G.KillSnapDepth        or 5
 _G.AutoRaid_Enabled    = false
 _G.AutoRaid_Retry      = false
 _G.AutoRaid_Return     = false
-_G.AutoRaid_Selected   = nil   -- строка вида "Muhammad Avdol Raid"
+_G.AutoRaid_Selected   = nil
 _G.RaidSessionId       = _G.RaidSessionId or 0
 
--- Чистим старый лог
 for _, g in ipairs(CoreGui:GetChildren()) do
     if g.Name == "BSLog" then pcall(function() g:Destroy() end) end
 end
@@ -76,45 +75,14 @@ local function Log(msg, color)
 end
 
 -- ==================== RAID NPC TABLE ====================
--- bossName  = имя объекта в workspace.Live для поиска цели рейда
--- npcName   = имя NPC (по billboard) в основном мире для начала рейда
--- ПОЗИЦИИ NPC — заполни после того как скинешь координаты
 local RAID_DATA = {
-    ["Muhammad Avdol Raid"] = {
-        bossName = "Muhammad Avdol",
-        npcName  = "Avdol",        -- уточни имя NPC в основном мире
-        npcPos   = nil,            -- Vector3.new(X,Y,Z) — добавь позицию
-    },
-    ["Jotaro Kujo Raid"] = {
-        bossName = "Jotaro Kujo",
-        npcName  = "Jotaro",
-        npcPos   = nil,
-    },
-    ["Kira Yoshikage Raid"] = {
-        bossName = "Yoshikage Kira",
-        npcName  = "Kira",
-        npcPos   = nil,
-    },
-    ["Dio Brando Raid"] = {
-        bossName = "Dio Brando",
-        npcName  = "Dio",
-        npcPos   = nil,
-    },
-    ["Prison Escape Raid"] = {
-        bossName = "Prison Guard",
-        npcName  = "Prison Warden",
-        npcPos   = nil,
-    },
-    ["Death 13 Raid"] = {
-        bossName = "Death 13",
-        npcName  = "Death 13",
-        npcPos   = nil,
-    },
-    ["Twoh Raid"] = {
-        bossName = "DIO Over Heaven",
-        npcName  = "Dio Over Heaven",
-        npcPos   = nil,
-    },
+    ["Muhammad Avdol Raid"] = { bossName = "Muhammad Avdol", npcName = "Avdol",        npcPos = nil },
+    ["Jotaro Kujo Raid"]    = { bossName = "Jotaro Kujo",    npcName = "Jotaro",       npcPos = nil },
+    ["Kira Yoshikage Raid"] = { bossName = "Yoshikage Kira", npcName = "Kira",         npcPos = nil },
+    ["Dio Brando Raid"]     = { bossName = "Dio Brando",     npcName = "Dio",          npcPos = nil },
+    ["Prison Escape Raid"]  = { bossName = "Prison Guard",   npcName = "Prison Warden",npcPos = nil },
+    ["Death 13 Raid"]       = { bossName = "Death 13",       npcName = "Death 13",     npcPos = nil },
+    ["Twoh Raid"]           = { bossName = "DIO Over Heaven",npcName = "Dio Over Heaven",npcPos = nil },
 }
 
 -- ==================== QUEST PARSING ====================
@@ -170,8 +138,6 @@ local function getModelPosition(obj)
     end
     return nil
 end
-
-local function doM1() pcall(function() mouse1click() end) end
 
 local savedCollide = {}
 local function setGhost(on)
@@ -242,11 +208,41 @@ local function getNpcHRP(npcObj)
     return nil
 end
 
+-- ==================== ТЕЛЕПОРТАЦИЯ (замена flyTo) ====================
+-- Мгновенно телепортирует персонажа к целевой позиции
+local function teleportTo(getTargetPos, arriveDist, isCancelled)
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp then return false end
+    if isCancelled and isCancelled() then return false end
+    local targetPos = getTargetPos()
+    if not targetPos then return false end
+    if _G.BS_Dead then return false end
+
+    setGhost(true)
+    hrp.Anchored = true
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+
+    -- Телепорт: смещаем на arriveDist от цели (чтобы не телепортироваться прямо в НПС)
+    local dist = (hrp.Position - targetPos).Magnitude
+    if dist > (arriveDist or 5) then
+        local dir = (hrp.Position - targetPos)
+        local offset = dir.Magnitude > 0.1
+            and dir.Unit * (arriveDist or 5)
+            or Vector3.new(0, 0, arriveDist or 5)
+        hrp.CFrame = CFrame.new(targetPos + offset)
+    end
+
+    task.wait(0.05)
+    return true
+end
+
 -- ==================== SNAP UNDER MOB ====================
 local function makeUnderCFrame(npcHRP)
     local p = npcHRP.Position
+    -- Убираем поворот на 90°: он мешал mouse1click
     return CFrame.new(p.X, p.Y - (_G.KillSnapDepth or 5), p.Z)
-        * CFrame.Angles(math.pi / 2, 0, 0)
 end
 
 local function startSnapLoop(hrp, npcHRP)
@@ -269,6 +265,27 @@ local function startSnapLoop(hrp, npcHRP)
         conn:Disconnect()
         Log("SNAP STOP", Color3.fromRGB(180,180,180))
     end
+end
+
+-- ==================== АТАКА ====================
+local function doAttack(mobHRP)
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    -- Поворачиваем персонажа к мобу для корректного mouse1click
+    if hrp and mobHRP then
+        local dir = Vector3.new(mobHRP.Position.X - hrp.Position.X, 0, mobHRP.Position.Z - hrp.Position.Z)
+        if dir.Magnitude > 0.1 then
+            hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + dir)
+        end
+    end
+    -- Основная атака
+    pcall(function() mouse1click() end)
+    -- Запасные методы
+    if mobHRP then
+        pcall(function() firetouchinterest(hrp, mobHRP, 0) end)
+        pcall(function() firetouchinterest(hrp, mobHRP, 1) end)
+    end
+    pcall(function() clickon(mobHRP) end)
 end
 
 local function findKillTarget(targetName)
@@ -313,49 +330,6 @@ local function findKillTarget(targetName)
     return best, bestDist
 end
 
-local function flyTo(getTargetPos, arriveDist, isCancelled)
-    local char = LocalPlayer.Character
-    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-    local hum  = char and char:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum then return false end
-    setGhost(true)
-    hrp.Anchored = true
-    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
-    local done = false
-    local nilTargetSince = nil
-    local conn = RunService.Heartbeat:Connect(function(dt)
-        if _G.BS_Dead then done = true; return end
-        if isCancelled and isCancelled() then done = true; return end
-        if not hrp or not hrp.Parent then done = true; return end
-        local targetPos = getTargetPos()
-        if not targetPos then
-            if not nilTargetSince then nilTargetSince = os.clock() end
-            if os.clock() - nilTargetSince > 0.8 then done = true end
-            return
-        end
-        nilTargetSince = nil
-        local cur   = hrp.Position
-        local delta = targetPos - cur
-        local dist  = delta.Magnitude
-        if dist <= arriveDist then done = true; return end
-        local step   = math.min(_G.FlySpeed * dt, dist)
-        local newPos = cur + delta.Unit * step
-        local flatDir = Vector3.new(delta.X, 0, delta.Z)
-        if flatDir.Magnitude > 0.05 then
-            hrp.CFrame = CFrame.new(newPos, newPos + flatDir)
-        else
-            hrp.CFrame = CFrame.new(newPos)
-        end
-    end)
-    local t0 = os.clock()
-    while not done and not _G.BS_Dead do
-        if os.clock() - t0 > 30 then Log("FLY TIMEOUT", Color3.fromRGB(255,120,0)); break end
-        task.wait()
-    end
-    conn:Disconnect()
-    return true
-end
-
 -- ==================== FIRE ALL PROXIMITY PROMPTS NEAR NPC ====================
 local function fireAllPromptsNear(npcHRP, radius)
     radius = radius or 12
@@ -375,12 +349,11 @@ local function fireAllPromptsNear(npcHRP, radius)
     return fired > 0
 end
 
--- ==================== DIALOG CLICK (улучшенный polling) ====================
--- Ищет первую кнопку варианта 1 в PlayerGui (GUI-диалоги игры)
+-- ==================== DIALOG CLICK (упрощённый, надёжный) ====================
 local function clickDialogOption()
-    -- Стратегия 1: Roblox Dialog/DialogChoice через RemoteEvent
+    -- Стратегия 1: нативные Roblox Dialog объекты
     for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("Dialog") and v.InUse then
+        if v:IsA("Dialog") then
             local choices = {}
             for _, c in ipairs(v:GetChildren()) do
                 if c:IsA("DialogChoice") then table.insert(choices, c) end
@@ -389,10 +362,14 @@ local function clickDialogOption()
                 return (a.ResponseOrder or 0) < (b.ResponseOrder or 0)
             end)
             for _, c in ipairs(choices) do
+                -- Пытаемся через RemoteEvent
                 for _, re in ipairs(v:GetDescendants()) do
-                    if re:IsA("RemoteEvent") then pcall(function() re:FireServer(c) end) end
+                    if re:IsA("RemoteEvent") then
+                        pcall(function() re:FireServer(c) end)
+                    end
                 end
                 pcall(function() firesignal(c.GoodbyeChoiceSelected) end)
+                pcall(function() firesignal(c.ResponseDialog.DialogChoiceSelected) end)
                 Log("DIALOG CHOICE (native)", Color3.fromRGB(0,255,200))
                 return true
             end
@@ -400,40 +377,58 @@ local function clickDialogOption()
     end
 
     -- Стратегия 2: GUI-кнопки в PlayerGui
+    -- Кликаем первую видимую кнопку, не принадлежащую нашему GUI
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false end
 
-    local best = nil
-    local bestPrio = 999
+    local candidates = {}
     for _, gui in ipairs(playerGui:GetDescendants()) do
         if gui:IsA("TextButton") and gui.Visible and gui.Active then
             local name = gui:GetFullName()
             if not name:find("BloodyHub") and not name:find("BSLog") then
                 local text = (gui.Text or ""):lower()
-                local prio = 999
-                if text:match("^%s*1[%.]")                     then prio = 1
-                elseif text:match("^%s*yes")                   then prio = 2
-                elseif text:match("^%s*accept")                then prio = 3
-                elseif text:match("^%s*sure")                  then prio = 4
-                elseif text:match("^%s*ok%s*$")               then prio = 5
+                local prio = 50
+                -- Высокий приоритет для кнопок с цифрами / да / принять
+                if text:match("^%s*1[%.]")                   then prio = 1
+                elseif text:match("^%s*yes")                 then prio = 2
+                elseif text:match("^%s*accept")              then prio = 3
+                elseif text:match("^%s*sure")                then prio = 4
+                elseif text:match("^%s*ok%s*$")              then prio = 5
+                elseif text:match("^%s*continue")            then prio = 6
+                elseif text:match("^%s*next")                then prio = 7
+                elseif text:match("^%s*start")               then prio = 8
+                elseif text ~= ""                            then prio = 20
                 end
-                if prio < bestPrio then bestPrio = prio; best = gui end
+                table.insert(candidates, { btn = gui, prio = prio })
             end
         end
     end
-    if best then
+
+    table.sort(candidates, function(a,b) return a.prio < b.prio end)
+
+    if #candidates > 0 then
+        local best = candidates[1].btn
+        -- Несколько способов нажать кнопку
+        pcall(function() firesignal(best.MouseButton1Click) end)
+        pcall(function() firesignal(best.Activated) end)
         pcall(function()
             for _, c in ipairs(getconnections(best.MouseButton1Click)) do c:Fire() end
         end)
-        pcall(function() firesignal(best.MouseButton1Click) end)
-        pcall(function() firesignal(best.Activated) end)
+        -- Попытка через VirtualInputManager
+        pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            local pos = best.AbsolutePosition + best.AbsoluteSize / 2
+            vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+            task.wait(0.05)
+            vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+        end)
         Log("GUI BTN clicked: "..(best.Text or "?"), Color3.fromRGB(0,255,200))
         return true
     end
+
     return false
 end
 
--- Ждёт появления кнопки диалога и кликает, timeout в секундах
 local function waitAndClickDialog(timeoutSecs)
     local t0 = os.clock()
     while os.clock() - t0 < timeoutSecs do
@@ -443,7 +438,7 @@ local function waitAndClickDialog(timeoutSecs)
     return false
 end
 
--- ==================== TALK LOGIC (ПОЛНЫЙ БЛОК ДО ЗАВЕРШЕНИЯ ДИАЛОГА) ====================
+-- ==================== TALK LOGIC ====================
 local Talking, Killing = false, false
 local CurrentTarget = nil
 
@@ -471,22 +466,20 @@ local function doTalkQuest(targetName, sessionId)
 
         Log("TALK -> "..targetName, Color3.fromRGB(0,200,255))
 
-        -- Летим к NPC
-        flyTo(function()
+        -- Телепортируемся к NPC
+        teleportTo(function()
             if not npcHRP or not npcHRP.Parent then return nil end
             return npcHRP.Position
         end, 6, function() return _G.QuestSessionId ~= sessionId end)
         forceUnlock()
         if _G.QuestSessionId ~= sessionId then return end
 
-        -- ======= ЦИКЛ: жмём proximity prompt и ждём диалог, повторяем пока квест не обновится =======
         local questDone = false
         local attemptMax = 5
         for attempt = 1, attemptMax do
             if _G.QuestSessionId ~= sessionId or _G.BS_Dead then break end
 
-            -- Снова подлетаем вплотную (на случай дрейфа)
-            flyTo(function()
+            teleportTo(function()
                 if not npcHRP or not npcHRP.Parent then return nil end
                 return npcHRP.Position
             end, 5, function() return _G.QuestSessionId ~= sessionId end)
@@ -495,16 +488,13 @@ local function doTalkQuest(targetName, sessionId)
 
             task.wait(0.25)
 
-            -- Жмём все ProximityPrompt рядом с NPC
             local fired = fireAllPromptsNear(npcHRP, 12)
             if not fired then
                 Log("NO PROMPT (attempt "..attempt..")", Color3.fromRGB(255,150,0))
             end
 
-            -- Ждём появления диалога и кликаем (до 4 секунд)
             local clicked = waitAndClickDialog(4)
             if clicked then
-                -- После клика может быть цепочка диалогов — кликаем ещё 2 раза с паузами
                 task.wait(0.4)
                 if _G.QuestSessionId == sessionId then clickDialogOption() end
                 task.wait(0.4)
@@ -513,7 +503,6 @@ local function doTalkQuest(targetName, sessionId)
                 if _G.QuestSessionId == sessionId then clickDialogOption() end
             end
 
-            -- Ждём обновления квеста (до 5 секунд)
             local t0 = os.clock()
             while os.clock() - t0 < 5 do
                 if cq and cq.Value ~= oldValue then
@@ -557,21 +546,27 @@ local function doKillLoop(targetName, sessionId)
                     task.wait(1); continue
                 end
             end
+
             local quest = getQuestInfo()
             if not quest or quest.type ~= "kill"
                 or quest.target:lower() ~= targetName:lower() then
                 Log("KILL DONE ✓", Color3.fromRGB(0,255,150)); break
             end
+
             local mob = CurrentTarget
             if not mob or not mob.Parent then CurrentTarget = nil; continue end
             local mobHRP = mob:FindFirstChild("HumanoidRootPart")
             if not mobHRP then CurrentTarget = nil; continue end
+
             local char = LocalPlayer.Character
             local hrp  = char and char:FindFirstChild("HumanoidRootPart")
             if not hrp then task.wait(0.5); continue end
+
             local dist = (hrp.Position - mobHRP.Position).Magnitude
+
             if dist > 5 then
-                flyTo(function()
+                -- Телепортируемся к мобу
+                teleportTo(function()
                     if not mob or not mob.Parent then return nil end
                     local r = mob:FindFirstChild("HumanoidRootPart")
                     return r and r.Position or nil
@@ -580,16 +575,20 @@ local function doKillLoop(targetName, sessionId)
                 end)
                 forceUnlock()
             else
+                -- Снапаемся под моба и атакуем
                 local stopSnap = startSnapLoop(hrp, mobHRP)
                 local attackStart = os.clock()
+                -- Порог: KillSnapDepth + 5 для надёжности
+                local attackThreshold = (_G.KillSnapDepth or 5) + 6
+
                 while _G.AutoQuest_Enabled and _G.QuestSessionId == sessionId
                     and not _G.BS_Dead and mob and mob.Parent do
                     local mh = mob:FindFirstChildOfClass("Humanoid")
                     if not mh or mh.Health <= 0 then break end
                     local hr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if not hr then break end
-                    if (hr.Position - mobHRP.Position).Magnitude > 8 then break end
-                    doM1()
+                    if (hr.Position - mobHRP.Position).Magnitude > attackThreshold then break end
+                    doAttack(mobHRP)
                     task.wait(_G.AttackDelay or 0.08)
                     if os.clock() - attackStart > 60 then
                         Log("ATTACK TIMEOUT", Color3.fromRGB(255,100,0))
@@ -650,8 +649,6 @@ task.spawn(function()
 end)
 
 -- ==================== AUTO RAID ====================
-
--- Найти объект цели рейда в workspace.Live
 local function findRaidTarget(bossName)
     local live = workspace:FindFirstChild("Live")
     if not live then return nil end
@@ -664,7 +661,6 @@ local function findRaidTarget(bossName)
             if hum and hum.Health > 0 then
                 local matched = v.Name:lower():find(lower, 1, true)
                 if not matched then
-                    -- проверяем billboard
                     for _, child in ipairs(v:GetDescendants()) do
                         if child:IsA("TextLabel") and child.Text:lower():find(lower, 1, true) then
                             matched = true; break
@@ -686,7 +682,6 @@ local function findRaidTarget(bossName)
     return best
 end
 
--- Кликнуть кнопку пост-рейда (Auto Retry или Return to menu)
 local function clickPostRaidButton(pattern)
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false end
@@ -696,11 +691,11 @@ local function clickPostRaidButton(pattern)
             if text:find(pattern:lower(), 1, true) then
                 local fullName = gui:GetFullName()
                 if not fullName:find("BloodyHub") and not fullName:find("BSLog") then
+                    pcall(function() firesignal(gui.MouseButton1Click) end)
+                    pcall(function() firesignal(gui.Activated) end)
                     pcall(function()
                         for _, c in ipairs(getconnections(gui.MouseButton1Click)) do c:Fire() end
                     end)
-                    pcall(function() firesignal(gui.MouseButton1Click) end)
-                    pcall(function() firesignal(gui.Activated) end)
                     Log("POST-RAID BTN: "..gui.Text, Color3.fromRGB(0,255,200))
                     return true
                 end
@@ -710,7 +705,6 @@ local function clickPostRaidButton(pattern)
     return false
 end
 
--- Проверить, появилось ли пост-рейдовое окно
 local function waitForPostRaidGui(timeoutSecs)
     local t0 = os.clock()
     while os.clock() - t0 < timeoutSecs do
@@ -743,17 +737,13 @@ local function doRaidLoop(raidName, raidSid)
         end
         Log("RAID START: "..raidName, Color3.fromRGB(255,180,0))
 
-        -- === Шаг 1: Найти NPC в основном мире и поговорить ===
-        -- (NPC запускает рейд через proximity prompt + option 1)
         local _, npcObj = findNpcByBillboard(data.npcName)
 
-        -- Если позиция задана явно и NPC не найден по billboard — летим к позиции
         if not npcObj and data.npcPos then
-            Log("NPC billboard not found, fly to npcPos", Color3.fromRGB(255,200,0))
-            flyTo(function() return data.npcPos end, 8,
+            Log("NPC billboard not found, teleport to npcPos", Color3.fromRGB(255,200,0))
+            teleportTo(function() return data.npcPos end, 8,
                 function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
             forceUnlock()
-            -- повторная попытка поиска после подлёта
             _, npcObj = findNpcByBillboard(data.npcName)
         end
 
@@ -768,8 +758,7 @@ local function doRaidLoop(raidName, raidSid)
             return
         end
 
-        -- Летим к NPC
-        flyTo(function()
+        teleportTo(function()
             if not npcHRP or not npcHRP.Parent then return nil end
             return npcHRP.Position
         end, 6, function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
@@ -778,10 +767,9 @@ local function doRaidLoop(raidName, raidSid)
 
         task.wait(0.3)
 
-        -- Жмём proximity prompt + диалог (до 5 попыток)
         for attempt = 1, 5 do
             if _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled then break end
-            flyTo(function()
+            teleportTo(function()
                 if not npcHRP or not npcHRP.Parent then return nil end
                 return npcHRP.Position
             end, 5, function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
@@ -799,7 +787,6 @@ local function doRaidLoop(raidName, raidSid)
             task.wait(0.5)
         end
 
-        -- === Шаг 2: Ждём телепорт в рейд (workspace.Live появляется с боссом) ===
         Log("WAITING FOR TELEPORT TO RAID...", Color3.fromRGB(255,200,0))
         local teleported = false
         local t0 = os.clock()
@@ -818,10 +805,8 @@ local function doRaidLoop(raidName, raidSid)
             return
         end
 
-        -- === Шаг 3: Убиваем всех мобов в workspace.Live по имени босса ===
         local raidKillStart = os.clock()
         while _G.AutoRaid_Enabled and _G.RaidSessionId == raidSid and not _G.BS_Dead do
-            -- Таймаут рейда 10 минут
             if os.clock() - raidKillStart > 600 then
                 Log("RAID KILL TIMEOUT", Color3.fromRGB(255,100,0)); break
             end
@@ -841,7 +826,7 @@ local function doRaidLoop(raidName, raidSid)
 
             local dist = (hrp.Position - mobHRP.Position).Magnitude
             if dist > 5 then
-                flyTo(function()
+                teleportTo(function()
                     if not mob or not mob.Parent then return nil end
                     local r = mob:FindFirstChild("HumanoidRootPart")
                     return r and r.Position or nil
@@ -852,14 +837,15 @@ local function doRaidLoop(raidName, raidSid)
             else
                 local stopSnap = startSnapLoop(hrp, mobHRP)
                 local attackStart = os.clock()
+                local attackThreshold = (_G.KillSnapDepth or 5) + 6
                 while _G.AutoRaid_Enabled and _G.RaidSessionId == raidSid
                     and not _G.BS_Dead and mob and mob.Parent do
                     local mh = mob:FindFirstChildOfClass("Humanoid")
                     if not mh or mh.Health <= 0 then break end
                     local hr = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if not hr then break end
-                    if (hr.Position - mobHRP.Position).Magnitude > 8 then break end
-                    doM1()
+                    if (hr.Position - mobHRP.Position).Magnitude > attackThreshold then break end
+                    doAttack(mobHRP)
                     task.wait(_G.AttackDelay or 0.08)
                     if os.clock() - attackStart > 60 then
                         Log("RAID ATTACK TIMEOUT", Color3.fromRGB(255,100,0)); break
@@ -870,27 +856,19 @@ local function doRaidLoop(raidName, raidSid)
             end
         end
 
-        -- === Шаг 4: Пост-рейд — Auto Retry / Auto Return ===
         if not _G.AutoRaid_Enabled or _G.RaidSessionId ~= raidSid then return end
 
-        -- Ждём пост-рейдовое GUI
         Log("WAITING POST-RAID GUI...", Color3.fromRGB(200,200,0))
-        local hasGui = waitForPostRaidGui(15)
+        waitForPostRaidGui(15)
 
         if _G.AutoRaid_Retry then
             local ok2 = clickPostRaidButton("auto retry")
-            if ok2 then
-                Log("AUTO RETRY triggered", Color3.fromRGB(0,255,100))
-            else
-                Log("AUTO RETRY btn not found", Color3.fromRGB(255,100,0))
-            end
+            Log(ok2 and "AUTO RETRY triggered" or "AUTO RETRY btn not found",
+                ok2 and Color3.fromRGB(0,255,100) or Color3.fromRGB(255,100,0))
         elseif _G.AutoRaid_Return then
             local ok2 = clickPostRaidButton("return to menu")
-            if ok2 then
-                Log("AUTO RETURN triggered", Color3.fromRGB(0,255,100))
-            else
-                Log("AUTO RETURN btn not found", Color3.fromRGB(255,100,0))
-            end
+            Log(ok2 and "AUTO RETURN triggered" or "AUTO RETURN btn not found",
+                ok2 and Color3.fromRGB(0,255,100) or Color3.fromRGB(255,100,0))
         end
     end)
     RaidRunning = false
@@ -898,7 +876,6 @@ local function doRaidLoop(raidName, raidSid)
     if not ok then Log("RAID ERR: "..tostring(err), Color3.fromRGB(255,0,0)) end
 end
 
--- Рейд-цикл
 task.spawn(function()
     while task.wait(1) do
         if _G.BS_Dead then break end
@@ -1006,7 +983,6 @@ end)
 -- ==================== PUBLIC API ====================
 _G.BloodyHub_API = {
     Log = Log,
-
     SetAutoQuest = function(v)
         _G.AutoQuest_Enabled  = v and true or false
         _G.AutoDialog_Enabled = _G.AutoQuest_Enabled
@@ -1018,8 +994,6 @@ _G.BloodyHub_API = {
     end,
     SetESP           = function(v) _G.ESP_Enabled = v and true or false end,
     SetKillSnapDepth = function(v) _G.KillSnapDepth = tonumber(v) or _G.KillSnapDepth end,
-
-    -- Auto Raid
     SetAutoRaid = function(v)
         _G.AutoRaid_Enabled = v and true or false
         if v then
@@ -1031,12 +1005,10 @@ _G.BloodyHub_API = {
     SetAutoRaidRetry  = function(v) _G.AutoRaid_Retry  = v and true or false end,
     SetAutoRaidReturn = function(v) _G.AutoRaid_Return = v and true or false end,
     SetRaidSelected   = function(v) _G.AutoRaid_Selected = v end,
-
-    -- Session
     DestroySession = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
 }
 
-Log("BloodyHub v83 LOADED", Color3.fromRGB(0,255,255))
+Log("BloodyHub v84 LOADED", Color3.fromRGB(0,255,255))
 
 -- ==================== LOAD UI ====================
 local ok, src = pcall(function() return game:HttpGet(UI_URL, true) end)
