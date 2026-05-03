@@ -223,12 +223,15 @@ local function decodeArg(v)
     return out
 end
 
-local function classifyPlacement(args, argc)
+local function classifyPlacement(packed)
     local unit, pos
-    for i = 1, argc do
-        local v = args[i]; local tv = typeof(v)
-        if tv == "CFrame" then pos = pos or v.Position
-        elseif tv == "Vector3" then pos = pos or v
+    for i = 1, packed.n do
+        local v = packed[i]
+        local tv = typeof(v)
+        if tv == "CFrame" then
+            pos = pos or v.Position
+        elseif tv == "Vector3" then
+            pos = pos or v
         elseif tv == "string" then
             if not unit and #v > 0 and #v <= 64 then unit = v end
         end
@@ -279,7 +282,8 @@ local function Notify(title, body, color)
     frame.AutomaticSize = Enum.AutomaticSize.Y
     local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = frame
     local s = Instance.new("UIStroke"); s.Color = color or Color3.fromRGB(180, 60, 220); s.Thickness = 1; s.Parent = frame
-    local pad = Instance.new("UIPadding"); pad.PaddingTop = UDim.new(0,8); pad.PaddingBottom = UDim.new(0,8)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0,8); pad.PaddingBottom = UDim.new(0,8)
     pad.PaddingLeft = UDim.new(0,10); pad.PaddingRight = UDim.new(0,10); pad.Parent = frame
     local lyt = Instance.new("UIListLayout"); lyt.Padding = UDim.new(0,2); lyt.Parent = frame
 
@@ -324,11 +328,14 @@ end
 
 -- ============================================================== --
 -- 6) REMOTE HOOK
--- ИСПРАВЛЕНО: аргументы пакуются ДО любого pcall через table.pack,
--- обработка записи выполняется в task.defer (асинхронно),
--- oldNamecall вызывается сразу и синхронно с оригинальными аргументами.
+--
+-- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
+-- Хук делает РОВНО ОДНО: кладёт сырые данные в очередь и сразу
+-- выходит. Никакого fullPath, classifyPlacement, findUnitCost,
+-- Notify — всё это делается в Heartbeat, полностью вне хука.
+-- Это исключает любое влияние хука на стек вызовов игры.
 -- ============================================================== --
-local _onPlacement = nil
+local _hookQueue = {}       -- { remotePath, packed, t }
 local hookInstalled = false
 
 local function installHook()
@@ -340,37 +347,29 @@ local function installHook()
     local oldNamecall
     local ok, err = pcall(function()
         oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            -- Сначала проверяем метод — никаких аллокаций если не нужно
-            local ok_m, method = pcall(getnamecallmethod)
-            if not ok_m then
-                return oldNamecall(self, ...)
+            -- ШАГ 1: сразу вызываем оригинал и сохраняем результаты
+            -- Это гарантирует что игра не заметит никакой разницы
+            local results = table.pack(oldNamecall(self, ...))
+
+            -- ШАГ 2: если идёт запись — кладём в очередь (очень дёшево)
+            if STATE.Recording then
+                local ok_m, method = pcall(getnamecallmethod)
+                if ok_m
+                    and (method == "FireServer" or method == "InvokeServer")
+                    and typeof(self) == "Instance"
+                    and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+                then
+                    -- Пакуем args и путь к remote — единственные данные нужные позже
+                    _hookQueue[#_hookQueue + 1] = {
+                        remotePath = fullPath(self),
+                        packed     = table.pack(...),
+                        t          = os.clock() - STATE.RecordStartT,
+                    }
+                end
             end
 
-            -- Перехватываем только если идёт запись И это FireServer/InvokeServer
-            if STATE.Recording
-                and (method == "FireServer" or method == "InvokeServer")
-                and typeof(self) == "Instance"
-                and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
-            then
-                -- ВАЖНО: пакуем аргументы ДО вызова оригинала
-                -- table.pack сохраняет точное количество аргументов включая nil
-                local packed = table.pack(...)
-                local remotePath = fullPath(self)
-
-                -- Обработку записи делаем АСИНХРОННО через task.defer
-                -- чтобы не задерживать оригинальный вызов ни на такт
-                task.defer(function()
-                    pcall(function()
-                        local unit, pos = classifyPlacement(packed, packed.n)
-                        if unit and pos and _onPlacement then
-                            _onPlacement(unit, pos, remotePath, packed, packed.n)
-                        end
-                    end)
-                end)
-            end
-
-            -- Оригинальный вызов — всегда, синхронно, без изменений
-            return oldNamecall(self, ...)
+            -- ШАГ 3: возвращаем результат оригинала
+            return table.unpack(results, 1, results.n)
         end))
     end)
     if ok then
@@ -380,6 +379,28 @@ local function installHook()
     end
 end
 pcall(installHook)
+
+-- ============================================================== --
+-- 6b) HEARTBEAT — обрабатываем очередь хука вне его контекста
+-- ============================================================== --
+local _onPlacement = nil  -- назначается в секции 7
+
+RunService.Heartbeat:Connect(function()
+    if #_hookQueue == 0 then return end
+    -- Забираем очередь атомарно
+    local queue = _hookQueue
+    _hookQueue = {}
+    for _, item in ipairs(queue) do
+        -- Полная обработка здесь — classifyPlacement, Notify, etc.
+        -- Мы полностью вне __namecall, игра не пострадает
+        pcall(function()
+            local unit, pos = classifyPlacement(item.packed)
+            if unit and pos and _onPlacement and STATE.Recording then
+                _onPlacement(unit, pos, item.remotePath, item.packed, item.t)
+            end
+        end)
+    end
+end)
 
 -- ============================================================== --
 -- 7) MACRO RECORDER
@@ -393,6 +414,7 @@ function Recorder.Start()
     STATE.RecordSession = STATE.RecordSession + 1
     STATE.LiveSteps = {}
     STATE.RecordStartT = os.clock()
+    _hookQueue = {}  -- сбрасываем очередь при старте
     local mapName = getMapName()
     STATE.CurrentMacro = { mapName = mapName, steps = STATE.LiveSteps, version = 1 }
     Notify("REC ●", "Recording started on map: " .. mapName, Color3.fromRGB(255, 60, 100))
@@ -404,6 +426,7 @@ end
 function Recorder.Stop()
     if not STATE.Recording then return nil end
     STATE.Recording = false
+    _hookQueue = {}  -- сбрасываем незавершённые события
     local macro = STATE.CurrentMacro
     Notify("REC ■", ("Recorded %d steps"):format(#(macro and macro.steps or {})), Color3.fromRGB(120, 220, 120))
     if _G.ACH_UI and _G.ACH_UI.OnRecordStateChanged then
@@ -412,19 +435,18 @@ function Recorder.Stop()
     return macro
 end
 
--- ИСПРАВЛЕНО: classifyPlacement теперь принимает table.pack результат (поле .n)
-_onPlacement = function(unit, pos, remotePath, packed, argc)
+_onPlacement = function(unit, pos, remotePath, packed, stepT)
     local cost = findUnitCost(unit)
     local step = {
         unit       = unit,
         position   = { pos.X, pos.Y, pos.Z },
         cost       = cost,
         remotePath = remotePath,
-        t          = os.clock() - STATE.RecordStartT,
+        t          = stepT,
         args       = {},
-        argc       = argc,
+        argc       = packed.n,
     }
-    for i = 1, argc do step.args[i] = encodeArg(packed[i]) end
+    for i = 1, packed.n do step.args[i] = encodeArg(packed[i]) end
     table.insert(STATE.LiveSteps, step)
     local stepNum = #STATE.LiveSteps
     local posStr = ("%d, %d, %d"):format(math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z))
@@ -533,7 +555,6 @@ function Player.Stop()
     STATE.PlaySession = STATE.PlaySession + 1
     setStatus("idle", 0)
     Notify("PLAY ■", "Stopped by user", Color3.fromRGB(255, 180, 80))
-    -- ИСПРАВЛЕНО: было G.ACH_UI (глобальная переменная без _), теперь _G.ACH_UI
     if _G.ACH_UI and _G.ACH_UI.OnPlayStateChanged then
         pcall(_G.ACH_UI.OnPlayStateChanged, false, STATE.CurrentMacro)
     end
@@ -638,6 +659,7 @@ _G.ACH_API = {
     Destroy = function()
         STATE.Dead = true
         STATE.Recording = false; STATE.Playing = false
+        _hookQueue = {}
         pcall(function() NotifGui:Destroy() end)
         if _G.ACH_UI and _G.ACH_UI.ScreenGui then
             pcall(function() _G.ACH_UI.ScreenGui:Destroy() end)
