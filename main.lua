@@ -1,14 +1,8 @@
---[[ BloodyHub main logic v4 (reliable attack + remote spy)
-- Убрана зависимость от mouse1click / VirtualInputManager для атак
-- Добавлен RemoteSpy (hookmetamethod) — логирует все FireServer/InvokeServer
-- Добавлен AttackDetect — захватывает remote при ручном M1 и потом сам его дёргает
-- AttackController использует:
-  1) захваченный remote (приоритет)
-  2) Tool:Activate() + внутренние RemoteEvent у Tool
-  3) firetouchinterest как fallback
-- Работает при unfocused window, не трогает UI
-- _G.BloodyHub_API расширен: ToggleRemoteSpy / StartAttackDetect / ClearAttackRemote / ToggleInputDebug
-- v4.1: hookmetamethod обёрнут в pcall, используется table.unpack — фиксит блокировку M1/стенда
+--[[ BloodyHub main logic v4.2
+- ФИКС: убран слепой tool:Activate() — он триггерил Summon:417 (nil call)
+- tryToolAttack теперь только ищет RemoteEvent внутри Tool с именем атаки
+- Без захваченного remote атака не выполняется (нужен Detect Attack Remote)
+- hookmetamethod обёрнут в pcall + table.unpack
 ]]
 local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
 
@@ -51,7 +45,6 @@ _G.AutoRaid_Return     = false
 _G.AutoRaid_Selected   = nil
 _G.RaidSessionId       = _G.RaidSessionId or 0
 
--- DEBUG / ATTACK DETECTION GLOBALS
 _G.BS_RemoteSpy_Enabled    = false
 _G.BS_InputDebug_Enabled   = false
 _G.BS_AttackDetectMode     = false
@@ -142,15 +135,11 @@ local function installRemoteHook()
 
     local oldNamecall
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        -- ВАЖНО: захватываем args и ВСЕГДА вызываем oldNamecall в конце
         local args = {...}
-
-        -- Вся логика шпиона/детекта обёрнута в pcall —
-        -- ошибки здесь НЕ блокируют оригинальный вызов игры
+        -- Вся логика шпиона в pcall — ошибки не блокируют оригинальный вызов
         pcall(function()
             local ok2, method = pcall(getnamecallmethod)
             if not ok2 then return end
-
             if (method == "FireServer" or method == "InvokeServer")
                 and typeof(self) == "Instance"
                 and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent")) then
@@ -173,8 +162,6 @@ local function installRemoteHook()
                 end
             end
         end)
-
-        -- table.unpack надёжнее чем ... в некоторых executor'ах
         return oldNamecall(self, table.unpack(args))
     end))
 
@@ -519,7 +506,7 @@ function MovementController:stop()
 end
 
 -- ==================================================================
--- ============= ATTACK CONTROLLER (RELIABLE) =======================
+-- ============= ATTACK CONTROLLER ==================================
 -- ==================================================================
 local AttackController = {}
 AttackController.target = nil
@@ -546,6 +533,7 @@ local function findToolAttackRemote(tool)
     return nil
 end
 
+-- Приоритет 1: replay захваченного remote
 local function tryReplayCapturedRemote(mobHRP)
     local cap = _G.BloodyHub_AttackRemote
     if not cap or typeof(cap) ~= "table" then return false end
@@ -575,13 +563,13 @@ local function tryReplayCapturedRemote(mobHRP)
     return ok
 end
 
+-- Приоритет 2: RemoteEvent внутри Tool с именем атаки
+-- ВАЖНО: tool:Activate() УБРАН — он триггерит Summon VFX и вызывает краши
 local function tryToolAttack(mobHRP)
     local char = LocalPlayer.Character
     if not char then return false end
     local tool = char:FindFirstChildOfClass("Tool")
     if not tool then return false end
-
-    pcall(function() tool:Activate() end)
 
     local re = findToolAttackRemote(tool)
     if re and mobHRP then
@@ -592,11 +580,13 @@ local function tryToolAttack(mobHRP)
                 re:InvokeServer(mobHRP)
             end
         end)
+        return true
     end
 
-    return true
+    return false
 end
 
+-- Приоритет 3: touch fallback
 local function tryTouchHit(mobHRP)
     if not firetouchinterest then return false end
     local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -1306,7 +1296,6 @@ _G.BloodyHub_API = {
     SetAutoRaidReturn = function(v) _G.AutoRaid_Return = v and true or false end,
     SetRaidSelected   = function(v) _G.AutoRaid_Selected = v end,
 
-    -- ===== DEBUG / ATTACK DETECT API =====
     ToggleRemoteSpy = function(v)
         _G.BS_RemoteSpy_Enabled = v and true or false
         Log("RemoteSpy: "..(v and "ON" or "OFF"),
@@ -1338,7 +1327,7 @@ _G.BloodyHub_API = {
     DestroySession = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
 }
 
-Log("BloodyHub v4.1 LOADED (hook fix)", Color3.fromRGB(0,255,255))
+Log("BloodyHub v4.2 LOADED (no blind Activate)", Color3.fromRGB(0,255,255))
 
 -- ==================== LOAD UI ====================
 local ok, src = pcall(function() return game:HttpGet(UI_URL, true) end)
