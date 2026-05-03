@@ -1,23 +1,6 @@
---[[ AnimeCrusadersHub main v1.0
-──────────────────────────────────────────────────────────────────
-Macro recorder/player для Anime Crusaders.
+--[[ AnimeCrusadersHub main v1.1 ]]
 
-Запись:
-  Хук на __namecall ловит FireServer у RemoteEvent'ов, среди аргументов
-  которых есть CFrame/Vector3 + string (имя юнита). Это и есть placement.
-  Для каждого шага сохраняется: unit, position, cost, t.
-
-Воспроизведение:
-  Идём по шагам. Если cost > cash — статус "waiting for N more cash".
-  Когда хватает — статус "placing unit", вызываем :FireServer с теми же
-  аргументами (по сохранённому remote path), идём дальше.
-
-Хранение:
-  AnimeCrusadersHub/Macros/<name>.json — 1 файл = 1 макро.
-──────────────────────────────────────────────────────────────────
-]]
-
-local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/AnimeCrusadersHub/main/ui.lua"
+local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
 
 -- ============================================================== --
 --                          СЕРВИСЫ                                --
@@ -31,7 +14,7 @@ local MarketplaceService = game:GetService("MarketplaceService")
 local LocalPlayer        = Players.LocalPlayer
 
 -- ============================================================== --
--- 1) CONFIG                                                       --
+-- 1) CONFIG
 -- ============================================================== --
 local CONFIG = {
 	BaseFolder      = "AnimeCrusadersHub",
@@ -42,25 +25,25 @@ local CONFIG = {
 }
 
 -- ============================================================== --
--- 2) STATE                                                        --
+-- 2) STATE
 -- ============================================================== --
 local STATE = {
-	Dead       = false,
-	Recording  = false,
-	Playing    = false,
-	Paused     = false,
+	Dead          = false,
+	Recording     = false,
+	Playing       = false,
+	Paused        = false,
 	RecordSession = 0,
 	PlaySession   = 0,
-	CurrentMacro = nil,        -- { mapName, steps = { {unit, pos, cost, remotePath, args} } }
-	LiveSteps    = {},         -- буфер при записи
-	RecordStartT = 0,
-	CurrentStep  = 0,          -- индекс текущего шага при playback
-	CurrentStatus= "idle",     -- idle / waiting / placing / error
-	CurrentNeed  = 0,
+	CurrentMacro  = nil,
+	LiveSteps     = {},
+	RecordStartT  = 0,
+	CurrentStep   = 0,
+	CurrentStatus = "idle",
+	CurrentNeed   = 0,
 }
 
 -- ============================================================== --
--- 3) FILES / FOLDERS                                              --
+-- 3) FILES / FOLDERS
 -- ============================================================== --
 local HAS_FS = (writefile and readfile and isfile and isfolder and listfiles) and true or false
 
@@ -72,7 +55,7 @@ end
 ensureFolders()
 
 -- ============================================================== --
--- 4) UTIL                                                         --
+-- 4) UTIL
 -- ============================================================== --
 local function safeName(s)
 	s = tostring(s or "macro")
@@ -87,7 +70,6 @@ local function getMapName()
 			if m then
 				local sv = m:FindFirstChild("MapName") or m:FindFirstChild("DisplayName")
 				if sv and sv:IsA("StringValue") then return sv.Value end
-				-- одиночный child = реальная карта
 				local kids = m:GetChildren()
 				if #kids == 1 and kids[1]:IsA("Model") then return kids[1].Name end
 				return m.Name
@@ -193,7 +175,6 @@ local function resolvePath(path)
 	return cur
 end
 
--- Сериализация args (CFrame/Vector3 → table)
 local function encodeArg(v)
 	local tv = typeof(v)
 	if tv == "CFrame" then
@@ -237,13 +218,11 @@ local function decodeArg(v)
 		return out
 	elseif t == "raw" then return v.v
 	end
-	-- обычная таблица без __t
 	local out = {}
 	for k, sub in pairs(v) do out[k] = decodeArg(sub) end
 	return out
 end
 
--- Распознать «placement-вызов»: есть string + (CFrame|Vector3)
 local function classifyPlacement(args, argc)
 	local unit, pos
 	for i = 1, argc do
@@ -259,7 +238,7 @@ local function classifyPlacement(args, argc)
 end
 
 -- ============================================================== --
--- 5) NOTIFICATIONS GUI                                            --
+-- 5) NOTIFICATIONS GUI
 -- ============================================================== --
 pcall(function()
 	for _, g in ipairs(CoreGui:GetChildren()) do
@@ -322,7 +301,6 @@ local function Notify(title, body, color)
 	b.TextColor3 = Color3.fromRGB(220, 220, 220)
 	b.Text = tostring(body or "")
 
-	-- появление + автоисчезание
 	frame.BackgroundTransparency = 1
 	t.TextTransparency = 1; b.TextTransparency = 1; s.Transparency = 1
 	local TweenService = game:GetService("TweenService")
@@ -345,9 +323,9 @@ local function Notify(title, body, color)
 end
 
 -- ============================================================== --
--- 6) REMOTE HOOK (recorder)                                        --
+-- 6) REMOTE HOOK
 -- ============================================================== --
-local _onPlacement = nil  -- function(unit, pos, remotePath, args)
+local _onPlacement = nil
 local hookInstalled = false
 local function installHook()
 	if hookInstalled then return end
@@ -362,8 +340,8 @@ local function installHook()
 			if not ok_m then return oldNamecall(self, ...) end
 
 			if STATE.Recording and (method == "FireServer" or method == "InvokeServer")
-				 and typeof(self) == "Instance"
-				 and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+				and typeof(self) == "Instance"
+				and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
 			then
 				local argc = select("#", ...)
 				local args = table.create and table.create(argc) or {}
@@ -384,7 +362,7 @@ end
 pcall(installHook)
 
 -- ============================================================== --
--- 7) MACRO RECORDER                                                --
+-- 7) MACRO RECORDER
 -- ============================================================== --
 local Recorder = {}
 
@@ -438,7 +416,7 @@ _onPlacement = function(unit, pos, remotePath, args, argc)
 end
 
 -- ============================================================== --
--- 8) MACRO PLAYER                                                  --
+-- 8) MACRO PLAYER
 -- ============================================================== --
 local Player = {}
 
@@ -534,13 +512,14 @@ function Player.Stop()
 	STATE.PlaySession = STATE.PlaySession + 1
 	setStatus("idle", 0)
 	Notify("PLAY ■", "Stopped by user", Color3.fromRGB(255, 180, 80))
+	-- ИСПРАВЛЕНО: было `*G.ACH_UI` и `pcall(G.ACH_UI...)`
 	if _G.ACH_UI and _G.ACH_UI.OnPlayStateChanged then
 		pcall(_G.ACH_UI.OnPlayStateChanged, false, STATE.CurrentMacro)
 	end
 end
 
 -- ============================================================== --
--- 9) FILE I/O (export/import)                                     --
+-- 9) FILE I/O
 -- ============================================================== --
 local Files = {}
 
@@ -600,16 +579,14 @@ function Files.Delete(path)
 end
 
 -- ============================================================== --
--- 10) PUBLIC API                                                  --
+-- 10) PUBLIC API
 -- ============================================================== --
 _G.ACH_API = {
-	-- Recorder
-	StartRecord = Recorder.Start,
-	StopRecord  = Recorder.Stop,
-	IsRecording = function() return STATE.Recording end,
+	StartRecord  = Recorder.Start,
+	StopRecord   = Recorder.Stop,
+	IsRecording  = function() return STATE.Recording end,
 	GetLiveSteps = function() return STATE.LiveSteps end,
 
-	-- Player
 	Play     = function(macro) Player.Start(macro) end,
 	PlayFile = function(path) local m = Files.Load(path); if m then Player.Start(m) end end,
 	StopPlay = Player.Stop,
@@ -627,13 +604,11 @@ _G.ACH_API = {
 		}
 	end,
 
-	-- Files
 	SaveCurrent = Files.SaveCurrent,
 	ListLibrary = Files.List,
 	LoadFile    = Files.Load,
 	DeleteFile  = Files.Delete,
 
-	-- Misc
 	GetMapName  = getMapName,
 	GetCash     = getCash,
 	GetCurrent  = function() return STATE.CurrentMacro end,
@@ -649,15 +624,33 @@ _G.ACH_API = {
 	end,
 }
 
-Notify("AnimeCrusadersHub", "v1.0 loaded — macro recorder ready", Color3.fromRGB(180, 120, 255))
+Notify("AnimeCrusadersHub", "v1.1 loaded — macro recorder ready", Color3.fromRGB(180, 120, 255))
 
 -- ============================================================== --
--- 11) UI LOADER                                                   --
+-- 11) UI LOADER (с защитой от 404)
 -- ============================================================== --
+local function looksLikeHttpError(src)
+	if type(src) ~= "string" or src == "" then return true end
+	local head = src:sub(1, 256)
+	if head:match("^%s*%d%d%d%s*:%s*") then return true end
+	if head:lower():find("not found", 1, true) then return true end
+	if head:lower():find("rate limit", 1, true) then return true end
+	if head:match("^%s*<!DOCTYPE") or head:match("^%s*<html") then return true end
+	return false
+end
+
 local ok, src = pcall(function() return game:HttpGet(UI_URL, true) end)
-if ok and src and src ~= "" then
-	local fn, lerr = loadstring(src)
-	if fn then pcall(fn) else warn("[ACH] ui.lua compile: " .. tostring(lerr)) end
+if not ok then
+	warn("[ACH] ui.lua HTTP error: " .. tostring(src))
+elseif looksLikeHttpError(src) then
+	warn(("[ACH] ui.lua: сервер вернул не-Lua ответ (вероятно 404). Первые 120 символов: %q")
+		:format(tostring(src):sub(1, 120)))
 else
-	warn("[ACH] ui.lua fetch failed")
+	local fn, lerr = loadstring(src, "=ui.lua")
+	if fn then
+		local okR, rerr = pcall(fn)
+		if not okR then warn("[ACH] ui.lua runtime: " .. tostring(rerr)) end
+	else
+		warn("[ACH] ui.lua compile: " .. tostring(lerr))
+	end
 end
