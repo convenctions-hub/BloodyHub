@@ -1,21 +1,21 @@
 --[[ BloodyHub main logic v5.0
-   ─────────────────────────────────────────────────────────────────
-   Структура:
-     1) CONFIG          — все настраиваемые числа в одном месте
-     2) STATE           — рантайм-флаги, без мусорных _G
-     3) UTIL            — мелкие хелперы
-     4) LOGGER GUI      — простой и компактный лог
-     5) DEBUG MODULE    — чистый remote-spy с фильтром по имени
-     6) COMBAT MODULE   — M1 remote, без кликов, без UI-инпута
-     7) MOVEMENT        — позиционирование под мобом
-     8) QUEST/RAID/ESP  — без изменений по логике
-     9) PUBLIC API      — для UI
-    10) UI LOADER
-   ─────────────────────────────────────────────────────────────────
-   Атака — только через RemoteEvent:
-     Workspace.Live.<Character>.client_character_controller.M1
-     :FireServer(true, false)
-   Никаких mouse1click / VirtualUser / firetouchinterest — НИКОГДА.
+─────────────────────────────────────────────────────────────────
+Структура:
+  1) CONFIG          — все настраиваемые числа в одном месте
+  2) STATE           — рантайм-флаги, без мусорных _G
+  3) UTIL            — мелкие хелперы
+  4) LOGGER GUI      — простой и компактный лог
+  5) DEBUG MODULE    — чистый remote-spy с фильтром по имени
+  6) COMBAT MODULE   — M1 remote, без кликов, без UI-инпута
+  7) MOVEMENT        — позиционирование под мобом
+  8) QUEST/RAID/ESP  — без изменений по логике
+  9) PUBLIC API      — для UI
+ 10) UI LOADER
+─────────────────────────────────────────────────────────────────
+Атака — только через RemoteEvent:
+  Workspace.Live.<Character>.client_character_controller.M1
+    :FireServer(true, false)
+Никаких mouse1click / VirtualUser / firetouchinterest — НИКОГДА.
 ]]
 
 local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
@@ -35,9 +35,9 @@ local LocalPlayer   = Players.LocalPlayer
 -- ============================================================== --
 local CONFIG = {
     -- Combat
-    AttackDelay   = 0.30,   -- секунд между M1 (slider-ready)
-    AttackRange   = 18,     -- максимальная дистанция атаки (studs)
-    AttackTick    = 0.05,   -- частота внутреннего цикла
+    AttackDelay   = 0.30,
+    AttackRange   = 18,
+    AttackTick    = 0.05,
     -- Movement
     CombatYOffset = 6,
     MoveTickRate  = 0.12,
@@ -49,7 +49,7 @@ local CONFIG = {
     QuestForwardDist   = 4,
     QuestTeleThreshold = 3.5,
     -- Debug
-    DebugFilter   = "M1",   -- подстрока в имени remote (case-insensitive)
+    DebugFilter   = "M1",
     DebugMaxLines = 18,
 }
 
@@ -67,10 +67,10 @@ local STATE = {
     RaidSession   = 0,
     ESP           = false,
     -- Combat
-    CombatToggle  = false,    -- master kill-aura toggle (для UI)
-    CombatTarget  = nil,      -- текущий моб (Model)
+    CombatToggle  = false,
+    CombatTarget  = nil,
     -- Debug
-    DebugEnabled  = false,    -- логировать ли отфильтрованные remote
+    DebugEnabled  = false,
 }
 
 -- ============================================================== --
@@ -177,13 +177,6 @@ end
 
 -- ============================================================== --
 -- 5)                       DEBUG MODULE                           --
---                                                                 --
---  Чистый remote-spy:                                             --
---    • включается тогглом                                         --
---    • логирует ТОЛЬКО RemoteEvent/Function, чьё имя содержит     --
---      CONFIG.DebugFilter (по умолчанию "M1")                     --
---    • печатает: имя remote + аргументы                           --
---    • не трогает оригинальный вызов (pass-through __namecall)    --
 -- ============================================================== --
 local Debug = {}
 
@@ -229,13 +222,17 @@ local function installRemoteHook()
     local oldNamecall
     local ok, err = pcall(function()
         oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            -- метод кэшируем ДО любых обращений к self
             local ok_m, method = pcall(getnamecallmethod)
             if not ok_m then return oldNamecall(self, ...) end
 
             if STATE.DebugEnabled
-               and (method == "FireServer" or method == "InvokeServer") then
+                and (method == "FireServer" or method == "InvokeServer") then
+                -- ВАЖНО: собираем аргументы ЗДЕСЬ, во внешнем vararg-скоупе,
+                -- а уже таблицу передаём во внутренний pcall.
                 local argc = select("#", ...)
+                local args = table.create and table.create(argc) or {}
+                for i = 1, argc do args[i] = (select(i, ...)) end
+
                 pcall(function()
                     if typeof(self) ~= "Instance" then return end
                     local filter = CONFIG.DebugFilter
@@ -243,8 +240,6 @@ local function installRemoteHook()
                     local nm = self.Name or ""
                     if not nm:lower():find(filter:lower(), 1, true) then return end
 
-                    local args = table.create and table.create(argc) or {}
-                    for i = 1, argc do args[i] = (select(i, ...)) end
                     Log(("[%s] %s  (%s)"):format(method, nm,
                         previewArgs(args, argc)),
                         Color3.fromRGB(255,200,0))
@@ -267,30 +262,18 @@ pcall(installRemoteHook)
 
 -- ============================================================== --
 -- 6)                       COMBAT MODULE                          --
---                                                                 --
---  Атака ТОЛЬКО через:                                            --
---    Workspace.Live.<Character>.client_character_controller.M1    --
---    :FireServer(true, false)                                     --
---                                                                 --
---  • Работает в фоне (task.spawn), независимо от фокуса окна.     --
---  • Не трогает мышь, GUI, инпут.                                 --
---  • Толстый rate-limit на CONFIG.AttackDelay.                    --
---  • Опциональная цель (placeholder findTarget) для kill-aura.    --
 -- ============================================================== --
 local Combat = {}
 Combat._lastFire = 0
 Combat._thread   = nil
 Combat._target   = nil
 
--- Резолвим M1-remote от персонажа игрока.
--- Сначала ищем в LocalPlayer.Character, затем fallback в Workspace.Live.<Name>.
 local function resolveM1Remote()
     local char = getMyChar()
     local ctrl = char and char:FindFirstChild("client_character_controller")
     if not ctrl then
         local live = workspace:FindFirstChild("Live")
         if live then
-            -- сначала по имени игрока, иначе — любой моб с контроллером
             local pchar = live:FindFirstChild(LocalPlayer.Name)
             if pchar then
                 ctrl = pchar:FindFirstChild("client_character_controller")
@@ -309,7 +292,6 @@ local function resolveM1Remote()
     return nil
 end
 
--- Кэш remote — обновляется только если предыдущий "умер"
 local _cachedM1
 local function getM1()
     if _cachedM1 and _cachedM1.Parent then return _cachedM1 end
@@ -317,7 +299,6 @@ local function getM1()
     return _cachedM1
 end
 
--- Низкоуровневый вызов: один M1, с rate-limit'ом.
 function Combat.FireOnce()
     if STATE.Dead then return false end
     local now = os.clock()
@@ -329,15 +310,11 @@ function Combat.FireOnce()
     return ok
 end
 
--- Placeholder для интеграции с автофармом / kill-aura.
--- Возвращает (mob, hrp) или nil. Можно подменить снаружи через Combat.SetFinder.
 local function defaultFindTarget()
-    -- если кто-то снаружи задал цель — используем её
     if Combat._target then
         local ok, hrp = isAlive(Combat._target)
         if ok then return Combat._target, hrp end
     end
-    -- иначе — ближайший моб в Workspace.Live в радиусе AttackRange
     local myHRP = select(1, getMyParts())
     if not myHRP then return nil end
     local live = workspace:FindFirstChild("Live")
@@ -345,7 +322,7 @@ local function defaultFindTarget()
     local best, bestD, bestHRP = nil, math.huge, nil
     for _, m in ipairs(live:GetDescendants()) do
         if m:IsA("Model") and m ~= getMyChar()
-           and not Players:GetPlayerFromCharacter(m) then
+            and not Players:GetPlayerFromCharacter(m) then
             local ok, hrp = isAlive(m)
             if ok then
                 local d = (hrp.Position - myHRP.Position).Magnitude
@@ -363,7 +340,6 @@ function Combat.SetFinder(fn) _finderFn = fn or defaultFindTarget end
 function Combat.SetTarget(mob) Combat._target = mob end
 function Combat.ClearTarget()  Combat._target = nil end
 
--- Главный цикл: запускается один раз, сам спит до тиков.
 function Combat.Start()
     if Combat._thread then return end
     STATE.CombatToggle = true
@@ -570,8 +546,8 @@ local function teleportTo(getPos, arriveDist, isCancelled)
     if d > (arriveDist or 5) then
         local dir = (hrp.Position - pos)
         local off = dir.Magnitude > 0.1
-            and dir.Unit * (arriveDist or 5)
-            or Vector3.new(0, 0, arriveDist or 5)
+                    and dir.Unit * (arriveDist or 5)
+                    or Vector3.new(0, 0, arriveDist or 5)
         local myPos = pos + off
         hrp.CFrame = CFrame.new(myPos, Vector3.new(pos.X, myPos.Y, pos.Z))
     end
@@ -616,7 +592,6 @@ local function MoveToNPC(npcHRP, opts)
     return true
 end
 
--- Поиск моба для kill-квеста (по имени)
 local function findKillTarget(targetName)
     local lower = targetName:lower()
     local hrp0 = select(1, getMyParts())
@@ -639,7 +614,7 @@ local function findKillTarget(targetName)
                     if not matched then
                         for _, c in ipairs(v:GetDescendants()) do
                             if c:IsA("TextLabel") and c.Text ~= ""
-                               and c.Text:lower():find(lower, 1, true) then
+                                and c.Text:lower():find(lower, 1, true) then
                                 matched = true; break
                             end
                         end
@@ -665,7 +640,7 @@ local function fireAllPromptsNear(npcHRP, radius)
         if v:IsA("ProximityPrompt") and v.Enabled then
             local part = v.Parent
             if part and part:IsA("BasePart")
-               and (part.Position - npcHRP.Position).Magnitude < radius then
+                and (part.Position - npcHRP.Position).Magnitude < radius then
                 v.HoldDuration = 0
                 pcall(function() fireproximityprompt(v) end)
                 fired = fired + 1
@@ -675,9 +650,6 @@ local function fireAllPromptsNear(npcHRP, radius)
     return fired > 0
 end
 
--- Клик по диалоговой кнопке через firesignal — это НЕ симуляция мыши,
--- а прямой вызов Click-сигнала на конкретной кнопке. Для совместимости
--- с квестовой системой оставлено.
 local function clickDialogOption()
     for _, v in ipairs(workspace:GetDescendants()) do
         if v:IsA("Dialog") then
@@ -809,7 +781,7 @@ local function doKillLoop(name, sid)
         while STATE.AutoQuest and STATE.QuestSession == sid and not STATE.Dead do
             local q = getQuestInfo()
             if not q or q.type ~= "kill"
-               or q.target:lower() ~= name:lower() then break end
+                or q.target:lower() ~= name:lower() then break end
             local valid = isAlive(cur)
             if not valid then
                 MovementController:clearTarget()
@@ -905,7 +877,7 @@ local function findRaidTarget(bossName)
                 if not matched then
                     for _, c in ipairs(v:GetDescendants()) do
                         if c:IsA("TextLabel")
-                           and c.Text:lower():find(lower, 1, true) then
+                            and c.Text:lower():find(lower, 1, true) then
                             matched = true; break
                         end
                     end
@@ -1134,8 +1106,6 @@ local function DestroySession()
     end
 end
 
--- Сброс состояния на респаун (без VirtualUser anti-idle —
--- никаких click-симуляций мы больше не делаем).
 LocalPlayer.CharacterAdded:Connect(function(char)
     savedCollide = {}
     Talking, Killing, RaidRunning = false, false, false
@@ -1174,10 +1144,10 @@ _G.BloodyHub_API = {
     SetRaidSelected   = function(v) STATE.AutoRaidPick = v end,
 
     -- Combat
-    SetCombat        = function(v) Combat.SetEnabled(v) end,    -- master kill-aura
+    SetCombat        = function(v) Combat.SetEnabled(v) end,
     SetAttackDelay   = function(v) Combat.SetDelay(v) end,
     SetAttackRange   = function(v) Combat.SetRange(v) end,
-    FireM1Once       = function()  Combat.FireOnce() end,       -- ручной выстрел
+    FireM1Once       = function()  Combat.FireOnce() end,
     SetCombatTarget  = function(m) Combat.SetTarget(m) end,
     ClearCombatTarget= function()  Combat.ClearTarget() end,
 
