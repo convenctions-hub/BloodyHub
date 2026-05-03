@@ -1,5 +1,5 @@
 --[[ AnimeCrusadersHub loader v1.0 ]]
-local BASE = "https://raw.githubusercontent.com/convenctions-hub/AnimeCrusadersHub/main/"
+local BASE = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/"
 
 local function fetch(name)
 	local ok, src = pcall(function()
