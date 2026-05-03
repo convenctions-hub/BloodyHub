@@ -1,10 +1,13 @@
---[[ BloodyHub main logic v3 (smooth combat rewrite)
-- Полностью переписаны movement + attack: без Heartbeat, без спама CFrame
-- MovementController: task.wait + CFrame:Lerp + dead zone + throttle
-- AttackController: отдельный поток, cooldown 0.3s
-- Стоит строго ПОД мобом на _G.CombatYOffset
-- Выставляет _G.BloodyHub_API для ui.lua
-- В конце подгружает ui.lua через loadstring
+--[[ BloodyHub main logic v4 (reliable attack + remote spy)
+- Убрана зависимость от mouse1click / VirtualInputManager для атак
+- Добавлен RemoteSpy (hookmetamethod) — логирует все FireServer/InvokeServer
+- Добавлен AttackDetect — захватывает remote при ручном M1 и потом сам его дёргает
+- AttackController использует:
+    1) захваченный remote (приоритет)
+    2) Tool:Activate() + внутренние RemoteEvent у Tool
+    3) firetouchinterest как fallback
+- Работает при unfocused window, не трогает UI
+- _G.BloodyHub_API расширен: ToggleRemoteSpy / StartAttackDetect / ClearAttackRemote / ToggleInputDebug
 ]]
 local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
 
@@ -24,38 +27,40 @@ _G.FlySpeed            = 120
 _G.BS_Dead             = false
 _G.QuestSessionId      = _G.QuestSessionId      or 0
 
--- Combat / movement tuning (все настраиваемые)
-_G.CombatYOffset       = _G.CombatYOffset       or 6      -- на сколько ниже моба стоим
-_G.MoveTickRate        = _G.MoveTickRate        or 0.12   -- частота обновления позиции (сек)
-_G.MoveLerpAlpha       = _G.MoveLerpAlpha       or 0.35   -- сглаживание (0..1)
-_G.MoveSnapDist        = _G.MoveSnapDist        or 25     -- если дальше — мгновенный снап (без лерпа)
-_G.MoveDeadZone        = _G.MoveDeadZone        or 0.4    -- мёртвая зона: ничего не делаем если уже близко
-_G.AttackCooldown      = _G.AttackCooldown      or 0.30   -- пауза между ударами
-_G.AttackRange         = _G.AttackRange         or 18     -- макс. дистанция для удара
-_G.AttackTickRate      = _G.AttackTickRate      or 0.05   -- частота проверки в attack-цикле
+_G.CombatYOffset       = _G.CombatYOffset       or 6
+_G.MoveTickRate        = _G.MoveTickRate        or 0.12
+_G.MoveLerpAlpha       = _G.MoveLerpAlpha       or 0.35
+_G.MoveSnapDist        = _G.MoveSnapDist        or 25
+_G.MoveDeadZone        = _G.MoveDeadZone        or 0.4
+_G.AttackCooldown      = _G.AttackCooldown      or 0.30
+_G.AttackRange         = _G.AttackRange         or 18
+_G.AttackTickRate      = _G.AttackTickRate      or 0.05
 
--- Quest movement
 _G.QuestForwardDist    = _G.QuestForwardDist    or 4
 _G.QuestTeleThreshold  = _G.QuestTeleThreshold  or 3.5
 _G.MoveDebounce        = _G.MoveDebounce        or 0.12
 
--- Совместимость со старыми именами
 _G.KillSnapDepth       = _G.KillSnapDepth       or _G.CombatYOffset
 _G.CombatDepth         = _G.CombatDepth         or _G.CombatYOffset
 _G.AttackDelay         = _G.AttackCooldown
 
--- Auto Raid globals
 _G.AutoRaid_Enabled    = false
 _G.AutoRaid_Retry      = false
 _G.AutoRaid_Return     = false
 _G.AutoRaid_Selected   = nil
 _G.RaidSessionId       = _G.RaidSessionId or 0
 
+-- DEBUG / ATTACK DETECTION GLOBALS
+_G.BS_RemoteSpy_Enabled    = false   -- логировать все FireServer/InvokeServer
+_G.BS_InputDebug_Enabled   = false   -- логировать клики мыши
+_G.BS_AttackDetectMode     = false   -- ждём ручной M1 для захвата remote
+_G.BloodyHub_AttackRemote  = _G.BloodyHub_AttackRemote or nil  -- {remote=Instance, method=string, args=table}
+
 for _, g in ipairs(CoreGui:GetChildren()) do
 	if g.Name == "BSLog" then pcall(function() g:Destroy() end) end
 end
 
--- ==================== DEBUG LOGGER ====================
+-- ==================== DEBUG LOGGER GUI ====================
 local DebugGui = Instance.new("ScreenGui")
 DebugGui.Name = "BSLog"
 pcall(function() DebugGui.Parent = CoreGui end)
@@ -95,6 +100,97 @@ local function Log(msg, color)
 	local ch = LogContainer:GetChildren()
 	if #ch > 18 then ch[2]:Destroy() end
 end
+
+-- ==================================================================
+-- =================== REMOTE SPY / DEBUG SYSTEM ====================
+-- ==================================================================
+-- Хук на __namecall ловит все :FireServer / :InvokeServer, в т.ч. вызовы из LocalScript'ов игры.
+-- При _G.BS_RemoteSpy_Enabled — печатает в наш лог.
+-- При _G.BS_AttackDetectMode — сохраняет ПЕРВЫЙ FireServer/InvokeServer как attack remote.
+
+local function safeArgPreview(args)
+	local out = {}
+	for i = 1, math.min(#args, 4) do
+		local v = args[i]
+		local tv = typeof(v)
+		if tv == "Instance" then
+			out[i] = "<"..v.ClassName..":"..v.Name..">"
+		elseif tv == "Vector3" or tv == "CFrame" then
+			out[i] = tv
+		elseif tv == "table" then
+			out[i] = "{table}"
+		elseif tv == "string" then
+			out[i] = '"'..v:sub(1,20)..'"'
+		else
+			out[i] = tostring(v)
+		end
+	end
+	if #args > 4 then out[#out+1] = "..(+"..(#args-4)..")" end
+	return table.concat(out, ", ")
+end
+
+local function deepCopyArgs(args)
+	-- Только верхний уровень — большего нам не надо для replay'а
+	local copy = {}
+	for i, v in ipairs(args) do copy[i] = v end
+	return copy
+end
+
+local hookInstalled = false
+local function installRemoteHook()
+	if hookInstalled then return end
+	if not hookmetamethod or not newcclosure or not getnamecallmethod then
+		Log("Executor lacks hookmetamethod — RemoteSpy DISABLED", Color3.fromRGB(255,100,100))
+		return
+	end
+
+	local oldNamecall
+	oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		local method = getnamecallmethod()
+		if (method == "FireServer" or method == "InvokeServer")
+		   and typeof(self) == "Instance"
+		   and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent")) then
+
+			local args = {...}
+
+			if _G.BS_RemoteSpy_Enabled then
+				Log("[REM] "..method.." -> "..self.Name.." ("..safeArgPreview(args)..")",
+					Color3.fromRGB(255,200,0))
+			end
+
+			if _G.BS_AttackDetectMode then
+				_G.BloodyHub_AttackRemote = {
+					remote = self,
+					method = method,
+					args   = deepCopyArgs(args),
+					path   = self:GetFullName(),
+				}
+				_G.BS_AttackDetectMode = false
+				Log("[ATTACK REMOTE CAPTURED] "..self:GetFullName(), Color3.fromRGB(0,255,100))
+				Log("  args: "..safeArgPreview(args), Color3.fromRGB(0,255,100))
+			end
+		end
+		return oldNamecall(self, ...)
+	end))
+
+	hookInstalled = true
+	Log("RemoteSpy hook installed", Color3.fromRGB(0,255,200))
+end
+pcall(installRemoteHook)
+
+-- ==================== INPUT DEBUG ====================
+-- Просто логируем mouse1, чтобы видеть, доходят ли клики до игры.
+UserInputSvc.InputBegan:Connect(function(input, gpe)
+	if not _G.BS_InputDebug_Enabled then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		Log(("[CLICK] gpe=%s pos=%d,%d"):format(
+			tostring(gpe), math.floor(input.Position.X), math.floor(input.Position.Y)),
+			Color3.fromRGB(0,200,255))
+		if gpe then
+			Log("  -> click captured by GUI (not game)!", Color3.fromRGB(255,100,100))
+		end
+	end
+end)
 
 -- ==================== RAID NPC TABLE ====================
 local RAID_DATA = {
@@ -244,7 +340,6 @@ local function getNpcHRP(npcObj)
 	return nil
 end
 
--- ==================== TARGET VALIDATION ====================
 local function isValidMob(mob)
 	if not mob or not mob.Parent then return false end
 	local hum = mob:FindFirstChildOfClass("Humanoid")
@@ -254,7 +349,6 @@ local function isValidMob(mob)
 	return true, hrp, hum
 end
 
--- ==================== HORIZONTAL TELEPORT (long-distance approach only) ====================
 local function teleportTo(getTargetPos, arriveDist, isCancelled)
 	local hrp, hum = getMyParts()
 	if not hrp then return false end
@@ -287,7 +381,6 @@ local function teleportTo(getTargetPos, arriveDist, isCancelled)
 	return true
 end
 
--- ==================== QUEST MOVE (используется только для подхода к NPC) ====================
 local _lastQuestMove = 0
 local function MoveToNPC(npcHRP, opts)
 	opts = opts or {}
@@ -333,24 +426,17 @@ local function MoveToNPC(npcHRP, opts)
 end
 
 -- ==================================================================
--- ============= MOVEMENT CONTROLLER (full rewrite) =================
+-- ============= MOVEMENT CONTROLLER =================================
 -- ==================================================================
--- Отдельный поток на task.wait, плавный CFrame:Lerp, мёртвая зона.
--- НИКАКОГО RunService.Heartbeat. CFrame обновляется максимум раз в _G.MoveTickRate.
--- Цель — стоять строго ПОД мобом (тот же X/Z, Y ниже на _G.CombatYOffset).
 local MovementController = {}
 MovementController.target = nil
 MovementController.active = false
 MovementController.paused = false
 MovementController._thread = nil
 
-function MovementController:setTarget(mob)
-	self.target = mob
-end
-
+function MovementController:setTarget(mob) self.target = mob end
 function MovementController:clearTarget()
 	self.target = nil
-	-- Полная остановка движения: снимаем якорь, отпускаем тело
 	local hrp, hum = getMyParts()
 	if hrp then hrp.Anchored = false end
 	if hum then
@@ -361,11 +447,9 @@ function MovementController:clearTarget()
 	end
 	setGhost(false)
 end
-
 function MovementController:setPaused(v)
 	self.paused = v and true or false
 	if self.paused then
-		-- На паузе разблокируем тело, чтобы диалоги/NPC работали
 		local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 		if hrp then hrp.Anchored = false end
 		setGhost(false)
@@ -373,10 +457,8 @@ function MovementController:setPaused(v)
 end
 
 local function computeUnderTargetCFrame(mobHRP)
-	-- стоим строго ПОД мобом
 	local mp = mobHRP.Position
 	local desiredPos = Vector3.new(mp.X, mp.Y - (_G.CombatYOffset or 6), mp.Z)
-	-- смотрим вверх на моба (немного смещаем по Z чтобы не было нулевого вектора)
 	local lookAt = Vector3.new(mp.X, mp.Y, mp.Z + 0.001)
 	return CFrame.new(desiredPos, lookAt)
 end
@@ -387,32 +469,22 @@ function MovementController:start()
 
 	self._thread = task.spawn(function()
 		while self.active do
-			-- Пауза (диалоги, NPC interaction) → ничего не делаем
 			if self.paused or _G.BS_Dead then
-				task.wait(_G.MoveTickRate or 0.12)
-				continue
+				task.wait(_G.MoveTickRate or 0.12); continue
 			end
 
-			-- Нет валидной цели → полная остановка
 			local mob = self.target
 			local valid, mobHRP = isValidMob(mob)
 			if not valid then
 				local hrp, hum = getMyParts()
 				if hrp and hrp.Anchored then hrp.Anchored = false end
-				if hum then
-					pcall(function() hum.PlatformStand = false end)
-				end
-				task.wait(_G.MoveTickRate or 0.12)
-				continue
+				if hum then pcall(function() hum.PlatformStand = false end) end
+				task.wait(_G.MoveTickRate or 0.12); continue
 			end
 
 			local hrp, hum = getMyParts()
-			if not hrp then
-				task.wait(_G.MoveTickRate or 0.12)
-				continue
-			end
+			if not hrp then task.wait(_G.MoveTickRate or 0.12); continue end
 
-			-- Подготавливаем тело (один раз за тик, не спамим)
 			setGhost(true)
 			if not hrp.Anchored then hrp.Anchored = true end
 			pcall(function()
@@ -425,14 +497,11 @@ function MovementController:start()
 			local delta = (hrp.Position - desiredCF.Position).Magnitude
 
 			if delta > (_G.MoveSnapDist or 25) then
-				-- Слишком далеко → мгновенный снап (без лерпа)
 				hrp.CFrame = desiredCF
 			elseif delta > (_G.MoveDeadZone or 0.4) then
-				-- Плавный лерп. CFrame обновляется ровно ОДИН раз за тик.
 				local alpha = math.clamp(_G.MoveLerpAlpha or 0.35, 0.05, 1)
 				hrp.CFrame = hrp.CFrame:Lerp(desiredCF, alpha)
 			end
-			-- Если delta меньше мёртвой зоны → НЕ трогаем CFrame вообще (нет джиттера)
 
 			task.wait(_G.MoveTickRate or 0.12)
 		end
@@ -446,10 +515,15 @@ function MovementController:stop()
 end
 
 -- ==================================================================
--- ============= ATTACK CONTROLLER (full rewrite) ===================
+-- ============= ATTACK CONTROLLER (RELIABLE) =======================
 -- ==================================================================
--- Отдельный поток. Кулдаун _G.AttackCooldown. Никакого спама.
--- Срабатывает ТОЛЬКО если есть валидная цель в радиусе _G.AttackRange.
+-- Стратегия атаки (по приоритету):
+--   1) Replay захваченного remote (_G.BloodyHub_AttackRemote) — самый надёжный путь
+--   2) Tool:Activate() — серверный аналог M1 для большинства игр с Tool
+--   3) RemoteEvent внутри текущего Tool с подходящим именем (Attack/Hit/M1/Swing/Punch)
+--   4) firetouchinterest(hrp, mobHRP) — для игр с touch-based hit detection
+-- Никаких mouse1click / VirtualInputManager. Работает в unfocused window. UI не задевается.
+
 local AttackController = {}
 AttackController.target = nil
 AttackController.active = false
@@ -460,19 +534,96 @@ function AttackController:setTarget(mob) self.target = mob end
 function AttackController:clearTarget()  self.target = nil end
 function AttackController:setPaused(v)   self.paused = v and true or false end
 
-local function performAttack(mobHRP)
-	-- Универсальная атака без зависимости от Tool:
-	-- 1) mouse1click — стандартный путь для большинства экзекьюторов
-	-- 2) firetouchinterest — touch-based hit detection
-	-- 3) clickon — fallback
-	pcall(function() if mouse1click then mouse1click() end end)
+local ATTACK_NAME_PATTERNS = { "attack", "hit", "m1", "swing", "punch", "combat", "damage", "strike" }
 
-	local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-	if hrp and mobHRP and mobHRP.Parent then
-		pcall(function() if firetouchinterest then firetouchinterest(hrp, mobHRP, 0) end end)
-		pcall(function() if firetouchinterest then firetouchinterest(hrp, mobHRP, 1) end end)
+local function findToolAttackRemote(tool)
+	if not tool then return nil end
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+			local lname = d.Name:lower()
+			for _, p in ipairs(ATTACK_NAME_PATTERNS) do
+				if lname:find(p, 1, true) then return d end
+			end
+		end
 	end
-	pcall(function() if clickon then clickon(mobHRP) end end)
+	return nil
+end
+
+local function tryReplayCapturedRemote(mobHRP)
+	local cap = _G.BloodyHub_AttackRemote
+	if not cap or typeof(cap) ~= "table" then return false end
+	local remote = cap.remote
+	if not remote or not remote.Parent then return false end
+
+	local args = cap.args or {}
+	-- Если в захваченных аргументах был mob/hrp/Vector3 — пробуем подставить актуальную цель.
+	-- Это эвристика: меняем только Instance (BasePart/Model) и Vector3 на текущие.
+	local replayArgs = {}
+	for i, v in ipairs(args) do
+		local tv = typeof(v)
+		if tv == "Instance" and (v:IsA("BasePart") or v:IsA("Model")) and mobHRP then
+			-- если оригинальный аргумент был частью моба — заменим на актуального
+			replayArgs[i] = mobHRP
+		elseif tv == "Vector3" and mobHRP then
+			replayArgs[i] = mobHRP.Position
+		else
+			replayArgs[i] = v
+		end
+	end
+
+	local ok = pcall(function()
+		if cap.method == "FireServer" then
+			remote:FireServer(unpack(replayArgs))
+		else
+			remote:InvokeServer(unpack(replayArgs))
+		end
+	end)
+	return ok
+end
+
+local function tryToolAttack(mobHRP)
+	local char = LocalPlayer.Character
+	if not char then return false end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool then return false end
+
+	local fired = false
+
+	-- 2a) Tool:Activate — серверная команда M1
+	pcall(function() tool:Activate() end)
+	fired = true
+
+	-- 2b) Найти RemoteEvent с осмысленным именем внутри Tool и дёрнуть
+	local re = findToolAttackRemote(tool)
+	if re and mobHRP then
+		pcall(function()
+			if re:IsA("RemoteEvent") then
+				re:FireServer(mobHRP)
+			else
+				re:InvokeServer(mobHRP)
+			end
+		end)
+	end
+
+	return fired
+end
+
+local function tryTouchHit(mobHRP)
+	if not firetouchinterest then return false end
+	local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp or not mobHRP or not mobHRP.Parent then return false end
+	pcall(function() firetouchinterest(hrp, mobHRP, 0) end)
+	pcall(function() firetouchinterest(hrp, mobHRP, 1) end)
+	return true
+end
+
+local function performAttack(mobHRP)
+	-- Приоритет 1: replay захваченного remote
+	if tryReplayCapturedRemote(mobHRP) then return end
+	-- Приоритет 2: Tool:Activate + Tool RemoteEvent
+	if tryToolAttack(mobHRP) then return end
+	-- Приоритет 3: touch fallback
+	tryTouchHit(mobHRP)
 end
 
 function AttackController:start()
@@ -483,31 +634,25 @@ function AttackController:start()
 		local lastAttack = 0
 		while self.active do
 			if self.paused or _G.BS_Dead then
-				task.wait(_G.AttackTickRate or 0.05)
-				continue
+				task.wait(_G.AttackTickRate or 0.05); continue
 			end
 
 			local mob = self.target
 			local valid, mobHRP = isValidMob(mob)
 			if not valid then
-				task.wait(_G.AttackTickRate or 0.05)
-				continue
+				task.wait(_G.AttackTickRate or 0.05); continue
 			end
 
 			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 			if not hrp then
-				task.wait(_G.AttackTickRate or 0.05)
-				continue
+				task.wait(_G.AttackTickRate or 0.05); continue
 			end
 
-			-- Проверяем дистанцию
 			local dist = (hrp.Position - mobHRP.Position).Magnitude
 			if dist > (_G.AttackRange or 18) then
-				task.wait(_G.AttackTickRate or 0.05)
-				continue
+				task.wait(_G.AttackTickRate or 0.05); continue
 			end
 
-			-- Кулдаун между ударами
 			local now = os.clock()
 			if (now - lastAttack) >= (_G.AttackCooldown or 0.3) then
 				performAttack(mobHRP)
@@ -533,8 +678,8 @@ local function findKillTarget(targetName)
 	local npcFolder = workspace:FindFirstChild("Npcs")
 	for _, v in ipairs(workspace:GetDescendants()) do
 		if v:IsA("Model") and not Players:GetPlayerFromCharacter(v)
-			and v:FindFirstChildOfClass("Humanoid")
-			and v:FindFirstChildOfClass("Humanoid").Health > 0 then
+		   and v:FindFirstChildOfClass("Humanoid")
+		   and v:FindFirstChildOfClass("Humanoid").Health > 0 then
 			local isQuestGiver = false
 			if npcFolder then
 				local p = v.Parent
@@ -568,7 +713,7 @@ local function findKillTarget(targetName)
 	return best, bestDist
 end
 
--- ==================== FIRE PROXIMITY PROMPTS ====================
+-- ==================== PROMPTS / DIALOG (без изменений по логике) ====================
 local function fireAllPromptsNear(npcHRP, radius)
 	radius = radius or 12
 	local fired = 0
@@ -576,7 +721,7 @@ local function fireAllPromptsNear(npcHRP, radius)
 		if v:IsA("ProximityPrompt") and v.Enabled then
 			local part = v.Parent
 			if part and part:IsA("BasePart")
-				and (part.Position - npcHRP.Position).Magnitude < radius then
+			   and (part.Position - npcHRP.Position).Magnitude < radius then
 				v.HoldDuration = 0
 				pcall(function() fireproximityprompt(v) end)
 				Log("PROMPT fired: "..part.Name, Color3.fromRGB(255,255,0))
@@ -587,7 +732,6 @@ local function fireAllPromptsNear(npcHRP, radius)
 	return fired > 0
 end
 
--- ==================== DIALOG CLICK ====================
 local function clickDialogOption()
 	for _, v in ipairs(workspace:GetDescendants()) do
 		if v:IsA("Dialog") then
@@ -595,9 +739,7 @@ local function clickDialogOption()
 			for _, c in ipairs(v:GetChildren()) do
 				if c:IsA("DialogChoice") then table.insert(choices, c) end
 			end
-			table.sort(choices, function(a,b)
-				return (a.ResponseOrder or 0) < (b.ResponseOrder or 0)
-			end)
+			table.sort(choices, function(a,b) return (a.ResponseOrder or 0) < (b.ResponseOrder or 0) end)
 			for _, c in ipairs(choices) do
 				for _, re in ipairs(v:GetDescendants()) do
 					if re:IsA("RemoteEvent") then
@@ -614,7 +756,6 @@ local function clickDialogOption()
 
 	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
 	if not playerGui then return false end
-
 	local candidates = {}
 	for _, gui in ipairs(playerGui:GetDescendants()) do
 		if gui:IsA("TextButton") and gui.Visible and gui.Active then
@@ -636,9 +777,7 @@ local function clickDialogOption()
 			end
 		end
 	end
-
 	table.sort(candidates, function(a,b) return a.prio < b.prio end)
-
 	if #candidates > 0 then
 		local best = candidates[1].btn
 		pcall(function() firesignal(best.MouseButton1Click) end)
@@ -646,17 +785,9 @@ local function clickDialogOption()
 		pcall(function()
 			for _, c in ipairs(getconnections(best.MouseButton1Click)) do c:Fire() end
 		end)
-		pcall(function()
-			local vim = game:GetService("VirtualInputManager")
-			local pos = best.AbsolutePosition + best.AbsoluteSize / 2
-			vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 1)
-			task.wait(0.05)
-			vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-		end)
 		Log("GUI BTN clicked: "..(best.Text or "?"), Color3.fromRGB(0,255,200))
 		return true
 	end
-
 	return false
 end
 
@@ -669,13 +800,12 @@ local function waitAndClickDialog(timeoutSecs)
 	return false
 end
 
--- ==================== TALK LOGIC ====================
+-- ==================== TALK / KILL / RAID логика (без существенных изменений) ====================
 local Talking, Killing = false, false
 
 local function doTalkQuest(targetName, sessionId)
 	if Talking then return end
 	Talking = true
-	-- На время диалога ставим контроллеры на паузу
 	MovementController:setPaused(true)
 	AttackController:setPaused(true)
 	MovementController:clearTarget()
@@ -688,15 +818,9 @@ local function doTalkQuest(targetName, sessionId)
 		local oldValue = cq and cq.Value or ""
 
 		local _, npcObj = findNpcByBillboard(targetName)
-		if not npcObj then
-			Log("NPC NOT FOUND: ["..targetName.."]", Color3.fromRGB(255,50,50))
-			return
-		end
+		if not npcObj then Log("NPC NOT FOUND: ["..targetName.."]", Color3.fromRGB(255,50,50)); return end
 		local npcHRP = getNpcHRP(npcObj)
-		if not npcHRP then
-			Log("HRP NOT FOUND: ["..targetName.."]", Color3.fromRGB(255,50,50))
-			return
-		end
+		if not npcHRP then Log("HRP NOT FOUND: ["..targetName.."]", Color3.fromRGB(255,50,50)); return end
 		local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 		if not hrp then return end
 
@@ -716,108 +840,79 @@ local function doTalkQuest(targetName, sessionId)
 		if _G.QuestSessionId ~= sessionId then return end
 
 		local questDone = false
-		local attemptMax = 5
-		for attempt = 1, attemptMax do
+		for attempt = 1, 5 do
 			if _G.QuestSessionId ~= sessionId or _G.BS_Dead then break end
-
-			MoveToNPC(npcHRP)
-			forceUnlock()
+			MoveToNPC(npcHRP); forceUnlock()
 			if _G.QuestSessionId ~= sessionId then break end
-
 			task.wait(0.25)
-
-			local fired = fireAllPromptsNear(npcHRP, 12)
-			if not fired then
+			if not fireAllPromptsNear(npcHRP, 12) then
 				Log("NO PROMPT (attempt "..attempt..")", Color3.fromRGB(255,150,0))
 			end
-
 			local clicked = waitAndClickDialog(4)
 			if clicked then
-				task.wait(0.4)
-				if _G.QuestSessionId == sessionId then clickDialogOption() end
-				task.wait(0.4)
-				if _G.QuestSessionId == sessionId then clickDialogOption() end
-				task.wait(0.4)
-				if _G.QuestSessionId == sessionId then clickDialogOption() end
+				task.wait(0.4); if _G.QuestSessionId == sessionId then clickDialogOption() end
+				task.wait(0.4); if _G.QuestSessionId == sessionId then clickDialogOption() end
+				task.wait(0.4); if _G.QuestSessionId == sessionId then clickDialogOption() end
 			end
-
 			local t0 = os.clock()
 			while os.clock() - t0 < 5 do
 				if cq and cq.Value ~= oldValue then
 					Log("QUEST UPDATED ✓", Color3.fromRGB(0,255,150))
-					questDone = true
-					break
+					questDone = true; break
 				end
 				task.wait(0.1)
 			end
-
 			if questDone then break end
-			Log("RETRY DIALOG "..attempt.."/"..attemptMax, Color3.fromRGB(255,200,0))
+			Log("RETRY DIALOG "..attempt.."/5", Color3.fromRGB(255,200,0))
 			task.wait(0.5)
 		end
-
-		if not questDone then
-			Log("DIALOG TIMEOUT — продолжаем", Color3.fromRGB(255,100,0))
-		end
+		if not questDone then Log("DIALOG TIMEOUT — продолжаем", Color3.fromRGB(255,100,0)) end
 	end)
 
 	Talking = false
 	MovementController:setPaused(false)
 	AttackController:setPaused(false)
 	forceUnlock()
-	if not ok then
-		Log("TALK ERR: "..tostring(err), Color3.fromRGB(255,0,0))
-	end
+	if not ok then Log("TALK ERR: "..tostring(err), Color3.fromRGB(255,0,0)) end
 end
 
--- ==================== KILL LOGIC (использует MovementController + AttackController) ====================
 local function doKillLoop(targetName, sessionId)
 	if Killing then return end
 	Killing = true
 
-	-- Запускаем контроллеры (они работают пока не остановим)
 	MovementController:start()
 	AttackController:start()
 
 	local ok, err = pcall(function()
 		local currentMob = nil
-
 		while _G.AutoQuest_Enabled and _G.QuestSessionId == sessionId and not _G.BS_Dead do
-			-- Проверяем квест
 			local quest = getQuestInfo()
 			if not quest or quest.type ~= "kill"
-				or quest.target:lower() ~= targetName:lower() then
+			   or quest.target:lower() ~= targetName:lower() then
 				Log("KILL DONE ✓", Color3.fromRGB(0,255,150)); break
 			end
 
-			-- Поиск/валидация цели
 			local valid = isValidMob(currentMob)
 			if not valid then
 				MovementController:clearTarget()
 				AttackController:clearTarget()
 				currentMob = nil
-
 				local mob, dist = findKillTarget(targetName)
 				if mob then
 					currentMob = mob
 					Log("TARGET: "..mob.Name.." ("..math.floor(dist).."m)", Color3.fromRGB(255,100,100))
 				else
 					Log("SEARCHING: "..targetName, Color3.fromRGB(255,150,0))
-					task.wait(1)
-					continue
+					task.wait(1); continue
 				end
 			end
 
 			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 			local mobHRP = currentMob and currentMob:FindFirstChild("HumanoidRootPart")
-			if not hrp or not mobHRP then
-				task.wait(0.5); continue
-			end
+			if not hrp or not mobHRP then task.wait(0.5); continue end
 
 			local dist = (hrp.Position - mobHRP.Position).Magnitude
-
 			if dist > 60 then
-				-- Очень далеко — длинный телепорт, контроллеры на паузе
 				MovementController:setPaused(true)
 				AttackController:setPaused(true)
 				MovementController:clearTarget()
@@ -833,16 +928,12 @@ local function doKillLoop(targetName, sessionId)
 				AttackController:setPaused(false)
 			end
 
-			-- Назначаем цель контроллерам
 			MovementController:setTarget(currentMob)
 			AttackController:setTarget(currentMob)
-
-			-- Главный цикл просто следит за состоянием — никаких CFrame операций здесь!
 			task.wait(0.3)
 		end
 	end)
 
-	-- Остановка контроллеров
 	MovementController:stop()
 	AttackController:stop()
 	Killing = false
@@ -863,8 +954,7 @@ task.spawn(function()
 			if os.clock() - lastActivityTime > 35 then
 				Log("WATCHDOG: reset", Color3.fromRGB(255,200,0))
 				Killing = false; Talking = false
-				MovementController:stop()
-				AttackController:stop()
+				MovementController:stop(); AttackController:stop()
 				forceUnlock()
 				lastActivityTime = os.clock()
 			end
@@ -884,8 +974,7 @@ task.spawn(function()
 		if quest.type ~= lastQuestType or quest.target ~= lastQuestTarget then
 			lastQuestType = quest.type; lastQuestTarget = quest.target
 			Talking = false; Killing = false
-			MovementController:stop()
-			AttackController:stop()
+			MovementController:stop(); AttackController:stop()
 			lastActivityTime = os.clock()
 			Log("QUEST ["..quest.type:upper().."]: "..quest.target, Color3.fromRGB(0,220,255))
 		end
@@ -922,9 +1011,7 @@ local function findRaidTarget(bossName)
 					if root and hrp0 then
 						local d = (root.Position - hrp0.Position).Magnitude
 						if d < bestDist then best = v; bestDist = d end
-					elseif root then
-						best = v; bestDist = 0
-					end
+					elseif root then best = v; bestDist = 0 end
 				end
 			end
 		end
@@ -963,9 +1050,7 @@ local function waitForPostRaidGui(timeoutSecs)
 			for _, gui in ipairs(playerGui:GetDescendants()) do
 				if (gui:IsA("TextButton") or gui:IsA("TextLabel")) and gui.Visible then
 					local text = (gui.Text or ""):lower()
-					if text:find("auto retry") or text:find("return to menu") then
-						return true
-					end
+					if text:find("auto retry") or text:find("return to menu") then return true end
 				end
 			end
 		end
@@ -975,44 +1060,30 @@ local function waitForPostRaidGui(timeoutSecs)
 end
 
 local RaidRunning = false
-
 local function doRaidLoop(raidName, raidSid)
 	if RaidRunning then return end
 	RaidRunning = true
 	local ok, err = pcall(function()
 		local data = RAID_DATA[raidName]
-		if not data then
-			Log("RAID DATA NOT FOUND: "..tostring(raidName), Color3.fromRGB(255,0,0))
-			return
-		end
+		if not data then Log("RAID DATA NOT FOUND: "..tostring(raidName), Color3.fromRGB(255,0,0)); return end
 		Log("RAID START: "..raidName, Color3.fromRGB(255,180,0))
 
-		-- Пауза контроллеров на время взаимодействия с NPC
 		MovementController:setPaused(true)
 		AttackController:setPaused(true)
 		MovementController:clearTarget()
 		AttackController:clearTarget()
 
 		local _, npcObj = findNpcByBillboard(data.npcName)
-
 		if not npcObj and data.npcPos then
-			Log("NPC billboard not found, teleport to npcPos", Color3.fromRGB(255,200,0))
 			teleportTo(function() return data.npcPos end, 8,
 				function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
 			forceUnlock()
 			_, npcObj = findNpcByBillboard(data.npcName)
 		end
-
-		if not npcObj then
-			Log("RAID NPC NOT FOUND: "..data.npcName, Color3.fromRGB(255,0,0))
-			return
-		end
+		if not npcObj then Log("RAID NPC NOT FOUND: "..data.npcName, Color3.fromRGB(255,0,0)); return end
 
 		local npcHRP = getNpcHRP(npcObj)
-		if not npcHRP then
-			Log("RAID NPC HRP NOT FOUND", Color3.fromRGB(255,0,0))
-			return
-		end
+		if not npcHRP then Log("RAID NPC HRP NOT FOUND", Color3.fromRGB(255,0,0)); return end
 
 		local hrp0 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 		if hrp0 and (hrp0.Position - npcHRP.Position).Magnitude > 30 then
@@ -1025,14 +1096,11 @@ local function doRaidLoop(raidName, raidSid)
 		MoveToNPC(npcHRP, { force = true })
 		forceUnlock()
 		if _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled then return end
-
 		task.wait(0.3)
 
 		for attempt = 1, 5 do
 			if _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled then break end
-			MoveToNPC(npcHRP)
-			forceUnlock()
-			task.wait(0.25)
+			MoveToNPC(npcHRP); forceUnlock(); task.wait(0.25)
 			fireAllPromptsNear(npcHRP, 12)
 			local clicked = waitAndClickDialog(4)
 			if clicked then
@@ -1051,19 +1119,11 @@ local function doRaidLoop(raidName, raidSid)
 		while os.clock() - t0 < 25 do
 			if not _G.AutoRaid_Enabled or _G.RaidSessionId ~= raidSid then return end
 			local target = findRaidTarget(data.bossName)
-			if target then
-				teleported = true
-				Log("IN RAID — target found: "..target.Name, Color3.fromRGB(0,255,100))
-				break
-			end
+			if target then teleported = true; Log("IN RAID — target found: "..target.Name, Color3.fromRGB(0,255,100)); break end
 			task.wait(0.5)
 		end
-		if not teleported then
-			Log("TELEPORT TIMEOUT", Color3.fromRGB(255,100,0))
-			return
-		end
+		if not teleported then Log("TELEPORT TIMEOUT", Color3.fromRGB(255,100,0)); return end
 
-		-- Боевая часть рейда — задействуем контроллеры
 		MovementController:setPaused(false)
 		AttackController:setPaused(false)
 		MovementController:start()
@@ -1073,31 +1133,19 @@ local function doRaidLoop(raidName, raidSid)
 		local currentMob = nil
 
 		while _G.AutoRaid_Enabled and _G.RaidSessionId == raidSid and not _G.BS_Dead do
-			if os.clock() - raidKillStart > 600 then
-				Log("RAID KILL TIMEOUT", Color3.fromRGB(255,100,0)); break
-			end
-
+			if os.clock() - raidKillStart > 600 then Log("RAID KILL TIMEOUT", Color3.fromRGB(255,100,0)); break end
 			local valid = isValidMob(currentMob)
 			if not valid then
-				MovementController:clearTarget()
-				AttackController:clearTarget()
+				MovementController:clearTarget(); AttackController:clearTarget()
 				currentMob = findRaidTarget(data.bossName)
-				if not currentMob then
-					Log("RAID: no more targets", Color3.fromRGB(0,255,150))
-					break
-				end
+				if not currentMob then Log("RAID: no more targets", Color3.fromRGB(0,255,150)); break end
 			end
-
 			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 			local mobHRP = currentMob and currentMob:FindFirstChild("HumanoidRootPart")
-			if not hrp or not mobHRP then
-				task.wait(0.5); continue
-			end
-
+			if not hrp or not mobHRP then task.wait(0.5); continue end
 			local dist = (hrp.Position - mobHRP.Position).Magnitude
 			if dist > 60 then
-				MovementController:setPaused(true)
-				AttackController:setPaused(true)
+				MovementController:setPaused(true); AttackController:setPaused(true)
 				teleportTo(function()
 					if not currentMob or not currentMob.Parent then return nil end
 					local r = currentMob:FindFirstChild("HumanoidRootPart")
@@ -1105,23 +1153,18 @@ local function doRaidLoop(raidName, raidSid)
 				end, 8, function()
 					return not _G.AutoRaid_Enabled or _G.RaidSessionId ~= raidSid
 				end)
-				MovementController:setPaused(false)
-				AttackController:setPaused(false)
+				MovementController:setPaused(false); AttackController:setPaused(false)
 			end
-
 			MovementController:setTarget(currentMob)
 			AttackController:setTarget(currentMob)
 			task.wait(0.3)
 		end
 
-		MovementController:stop()
-		AttackController:stop()
-
+		MovementController:stop(); AttackController:stop()
 		if not _G.AutoRaid_Enabled or _G.RaidSessionId ~= raidSid then return end
 
 		Log("WAITING POST-RAID GUI...", Color3.fromRGB(200,200,0))
 		waitForPostRaidGui(15)
-
 		if _G.AutoRaid_Retry then
 			local ok2 = clickPostRaidButton("auto retry")
 			Log(ok2 and "AUTO RETRY triggered" or "AUTO RETRY btn not found",
@@ -1132,10 +1175,8 @@ local function doRaidLoop(raidName, raidSid)
 				ok2 and Color3.fromRGB(0,255,100) or Color3.fromRGB(255,100,0))
 		end
 	end)
-	MovementController:stop()
-	AttackController:stop()
-	RaidRunning = false
-	forceUnlock()
+	MovementController:stop(); AttackController:stop()
+	RaidRunning = false; forceUnlock()
 	if not ok then Log("RAID ERR: "..tostring(err), Color3.fromRGB(255,0,0)) end
 end
 
@@ -1162,36 +1203,28 @@ local function CreateESP(p)
 		local head = char:WaitForChild("Head", 10)
 		if not head then return end
 		local bg = Instance.new("BillboardGui")
-		bg.Parent = head
-		bg.Name = "BS_ESP"; bg.AlwaysOnTop = true
+		bg.Parent = head; bg.Name = "BS_ESP"; bg.AlwaysOnTop = true
 		bg.Size = UDim2.new(0,100,0,30)
 		local tl = Instance.new("TextLabel")
-		tl.Parent = bg
-		tl.Size = UDim2.new(1,0,1,0)
-		tl.BackgroundTransparency = 1
-		tl.TextColor3 = Color3.new(1,1,1)
-		tl.Font = Enum.Font.GothamBold
-		tl.TextSize = 13
+		tl.Parent = bg; tl.Size = UDim2.new(1,0,1,0)
+		tl.BackgroundTransparency = 1; tl.TextColor3 = Color3.new(1,1,1)
+		tl.Font = Enum.Font.GothamBold; tl.TextSize = 13
 		local highOk, high = pcall(Instance.new, "Highlight")
 		if not highOk then high = nil end
 		if high then
-			high.Name = "BS_ESP"
-			high.FillColor = Color3.fromRGB(255,0,50)
-			high.Parent = char
+			high.Name = "BS_ESP"; high.FillColor = Color3.fromRGB(255,0,50); high.Parent = char
 		end
 		local conn = RunService.Heartbeat:Connect(function()
 			if _G.BS_Dead then bg:Destroy(); if high then high:Destroy() end; return end
 			if _G.ESP_Enabled and char and char.Parent
-				and LocalPlayer.Character
-				and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+			   and LocalPlayer.Character
+			   and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
 				local d = math.floor(
 					(LocalPlayer.Character.HumanoidRootPart.Position - head.Position).Magnitude)
 				tl.Text = p.Name.." ["..d.."m]"
-				bg.Enabled = true
-				if high then high.Enabled = true end
+				bg.Enabled = true; if high then high.Enabled = true end
 			else
-				bg.Enabled = false
-				if high then high.Enabled = false end
+				bg.Enabled = false; if high then high.Enabled = false end
 			end
 		end)
 		table.insert(espConnections, conn)
@@ -1209,8 +1242,7 @@ _G.BS_DestroyFn = function()
 	_G.AutoQuest_Enabled = false
 	_G.AutoRaid_Enabled = false
 	Talking = false; Killing = false; RaidRunning = false
-	MovementController:stop()
-	AttackController:stop()
+	MovementController:stop(); AttackController:stop()
 	forceUnlock()
 	for _, c in ipairs(espConnections) do pcall(function() c:Disconnect() end) end
 	espConnections = {}
@@ -1239,8 +1271,7 @@ end)
 LocalPlayer.CharacterAdded:Connect(function(char)
 	savedCollide = {}
 	Talking = false; Killing = false; RaidRunning = false
-	MovementController:stop()
-	AttackController:stop()
+	MovementController:stop(); AttackController:stop()
 	local hrp = char:WaitForChild("HumanoidRootPart", 5)
 	if hrp then hrp.Anchored = false end
 	Log("RESPAWN — state reset", Color3.fromRGB(200,200,0))
@@ -1249,57 +1280,79 @@ end)
 -- ==================== PUBLIC API ====================
 _G.BloodyHub_API = {
 	Log = Log,
+
 	SetAutoQuest = function(v)
 		_G.AutoQuest_Enabled  = v and true or false
 		_G.AutoDialog_Enabled = _G.AutoQuest_Enabled
-		if v then
-			_G.QuestSessionId = _G.QuestSessionId + 1
+		if v then _G.QuestSessionId = _G.QuestSessionId + 1
 		else
 			Talking = false; Killing = false
-			MovementController:stop()
-			AttackController:stop()
+			MovementController:stop(); AttackController:stop()
 		end
 	end,
+
 	SetESP           = function(v) _G.ESP_Enabled = v and true or false end,
 	SetKillSnapDepth = function(v)
 		local n = tonumber(v)
-		if n then
-			_G.KillSnapDepth   = n
-			_G.CombatDepth     = n
-			_G.CombatYOffset   = n
-		end
+		if n then _G.KillSnapDepth = n; _G.CombatDepth = n; _G.CombatYOffset = n end
 	end,
 	SetCombatYOffset = function(v)
 		local n = tonumber(v)
 		if n then _G.CombatYOffset = n; _G.KillSnapDepth = n; _G.CombatDepth = n end
 	end,
 	SetAttackCooldown = function(v)
-		local n = tonumber(v)
-		if n then _G.AttackCooldown = n; _G.AttackDelay = n end
+		local n = tonumber(v); if n then _G.AttackCooldown = n; _G.AttackDelay = n end
 	end,
-	SetMoveTickRate = function(v)
-		local n = tonumber(v); if n then _G.MoveTickRate = n end
-	end,
+	SetMoveTickRate = function(v) local n = tonumber(v); if n then _G.MoveTickRate = n end end,
 	SetMoveLerpAlpha = function(v)
 		local n = tonumber(v); if n then _G.MoveLerpAlpha = math.clamp(n, 0.05, 1) end
 	end,
+
 	SetAutoRaid = function(v)
 		_G.AutoRaid_Enabled = v and true or false
-		if v then
-			_G.RaidSessionId = _G.RaidSessionId + 1
+		if v then _G.RaidSessionId = _G.RaidSessionId + 1
 		else
 			RaidRunning = false
-			MovementController:stop()
-			AttackController:stop()
+			MovementController:stop(); AttackController:stop()
 		end
 	end,
 	SetAutoRaidRetry  = function(v) _G.AutoRaid_Retry  = v and true or false end,
 	SetAutoRaidReturn = function(v) _G.AutoRaid_Return = v and true or false end,
 	SetRaidSelected   = function(v) _G.AutoRaid_Selected = v end,
+
+	-- ===== DEBUG / ATTACK DETECT API =====
+	ToggleRemoteSpy = function(v)
+		_G.BS_RemoteSpy_Enabled = v and true or false
+		Log("RemoteSpy: "..(v and "ON" or "OFF"),
+			v and Color3.fromRGB(0,255,150) or Color3.fromRGB(180,180,180))
+	end,
+	ToggleInputDebug = function(v)
+		_G.BS_InputDebug_Enabled = v and true or false
+		Log("InputDebug: "..(v and "ON" or "OFF"),
+			v and Color3.fromRGB(0,255,150) or Color3.fromRGB(180,180,180))
+	end,
+	StartAttackDetect = function()
+		if not hookInstalled then
+			Log("Cannot detect — hookmetamethod missing", Color3.fromRGB(255,100,100))
+			return
+		end
+		_G.BS_AttackDetectMode = true
+		Log(">> Click M1 ONCE on a mob now <<", Color3.fromRGB(255,255,0))
+	end,
+	ClearAttackRemote = function()
+		_G.BloodyHub_AttackRemote = nil
+		Log("Captured attack remote cleared", Color3.fromRGB(255,200,0))
+	end,
+	GetAttackRemoteInfo = function()
+		local cap = _G.BloodyHub_AttackRemote
+		if not cap then return "none" end
+		return cap.path or "?"
+	end,
+
 	DestroySession = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
 }
 
-Log("BloodyHub v88 LOADED (smooth combat)", Color3.fromRGB(0,255,255))
+Log("BloodyHub v4 LOADED (reliable attack)", Color3.fromRGB(0,255,255))
 
 -- ==================== LOAD UI ====================
 local ok, src = pcall(function() return game:HttpGet(UI_URL, true) end)
