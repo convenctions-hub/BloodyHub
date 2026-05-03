@@ -1,8 +1,10 @@
---[[ BloodyHub main logic v4.2
-- ФИКС: убран слепой tool:Activate() — он триггерил Summon:417 (nil call)
-- tryToolAttack теперь только ищет RemoteEvent внутри Tool с именем атаки
-- Без захваченного remote атака не выполняется (нужен Detect Attack Remote)
-- hookmetamethod обёрнут в pcall + table.unpack
+--[[ BloodyHub main logic v4.3
+- ФИКС КРАША НА ЗАГРУЗКЕ: __namecall теперь пробрасывает варарги напрямую
+  (без {...}/table.unpack), сохраняя nil-аргументы.
+- getnamecallmethod() кэшируется ПЕРВЫМ, до любых методов на self.
+- Сборка args через select("#", ...) — корректно с nil.
+- VirtualUser / CoreGui / Idled / hook install обёрнуты в pcall.
+- tryToolAttack: только RemoteEvent внутри Tool с именем атаки (без слепого Activate).
 ]]
 local UI_URL = "https://raw.githubusercontent.com/convenctions-hub/BloodyHub/main/ui.lua"
 
@@ -10,9 +12,11 @@ local HttpService   = game:GetService("HttpService")
 local Players       = game:GetService("Players")
 local RunService    = game:GetService("RunService")
 local UserInputSvc  = game:GetService("UserInputService")
-local VirtualUser   = game:GetService("VirtualUser")
 local CoreGui       = game:GetService("CoreGui")
 local LocalPlayer   = Players.LocalPlayer
+
+local VirtualUser
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 
 -- ==================== GLOBAL DEFAULTS ====================
 _G.AutoQuest_Enabled   = _G.AutoQuest_Enabled   or false
@@ -50,9 +54,11 @@ _G.BS_InputDebug_Enabled   = false
 _G.BS_AttackDetectMode     = false
 _G.BloodyHub_AttackRemote  = _G.BloodyHub_AttackRemote or nil
 
-for _, g in ipairs(CoreGui:GetChildren()) do
-    if g.Name == "BSLog" then pcall(function() g:Destroy() end) end
-end
+pcall(function()
+    for _, g in ipairs(CoreGui:GetChildren()) do
+        if g.Name == "BSLog" then pcall(function() g:Destroy() end) end
+    end
+end)
 
 -- ==================== DEBUG LOGGER GUI ====================
 local DebugGui = Instance.new("ScreenGui")
@@ -100,7 +106,8 @@ end
 -- ==================================================================
 local function safeArgPreview(args)
     local out = {}
-    for i = 1, math.min(#args, 4) do
+    local n = #args
+    for i = 1, math.min(n, 4) do
         local v = args[i]
         local tv = typeof(v)
         if tv == "Instance" then
@@ -115,14 +122,8 @@ local function safeArgPreview(args)
             out[i] = tostring(v)
         end
     end
-    if #args > 4 then out[#out+1] = "..(+"..(#args-4)..")" end
+    if n > 4 then out[#out+1] = "..(+"..(n-4)..")" end
     return table.concat(out, ", ")
-end
-
-local function deepCopyArgs(args)
-    local copy = {}
-    for i, v in ipairs(args) do copy[i] = v end
-    return copy
 end
 
 local hookInstalled = false
@@ -134,53 +135,78 @@ local function installRemoteHook()
     end
 
     local oldNamecall
-    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local args = {...}
-        -- Вся логика шпиона в pcall — ошибки не блокируют оригинальный вызов
-        pcall(function()
-            local ok2, method = pcall(getnamecallmethod)
-            if not ok2 then return end
-            if (method == "FireServer" or method == "InvokeServer")
-                and typeof(self) == "Instance"
-                and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent")) then
-
-                if _G.BS_RemoteSpy_Enabled then
-                    Log("[REM] "..method.." -> "..self.Name.." ("..safeArgPreview(args)..")",
-                        Color3.fromRGB(255,200,0))
-                end
-
-                if _G.BS_AttackDetectMode then
-                    _G.BloodyHub_AttackRemote = {
-                        remote = self,
-                        method = method,
-                        args   = deepCopyArgs(args),
-                        path   = self:GetFullName(),
-                    }
-                    _G.BS_AttackDetectMode = false
-                    Log("[ATTACK REMOTE CAPTURED] "..self:GetFullName(), Color3.fromRGB(0,255,100))
-                    Log("  args: "..safeArgPreview(args), Color3.fromRGB(0,255,100))
-                end
+    local ok, err = pcall(function()
+        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            -- ВАЖНО: метод кэшируем ПЕРВЫМ, до любых вызовов методов на self,
+            -- иначе getnamecallmethod() вернёт уже другое значение.
+            local ok_m, method = pcall(getnamecallmethod)
+            if not ok_m then
+                return oldNamecall(self, ...)
             end
-        end)
-        return oldNamecall(self, table.unpack(args))
-    end))
 
-    hookInstalled = true
-    Log("RemoteSpy hook installed", Color3.fromRGB(0,255,200))
+            if method == "FireServer" or method == "InvokeServer" then
+                -- Захват аргументов через select — корректно с nil.
+                local argc = select("#", ...)
+                -- Вся логика шпиона — в pcall, чтобы не блокировать оригинальный вызов.
+                pcall(function()
+                    if typeof(self) ~= "Instance" then return end
+                    if not (self:IsA("RemoteEvent")
+                         or self:IsA("RemoteFunction")
+                         or (self.IsA and self:IsA("UnreliableRemoteEvent"))) then
+                        return
+                    end
+
+                    local args = table.create and table.create(argc) or {}
+                    for i = 1, argc do args[i] = (select(i, ...)) end
+
+                    if _G.BS_RemoteSpy_Enabled then
+                        Log("[REM] "..method.." -> "..self.Name.." ("..safeArgPreview(args)..")",
+                            Color3.fromRGB(255,200,0))
+                    end
+
+                    if _G.BS_AttackDetectMode then
+                        _G.BloodyHub_AttackRemote = {
+                            remote = self,
+                            method = method,
+                            args   = args,
+                            path   = self:GetFullName(),
+                        }
+                        _G.BS_AttackDetectMode = false
+                        Log("[ATTACK REMOTE CAPTURED] "..self:GetFullName(), Color3.fromRGB(0,255,100))
+                        Log("  args: "..safeArgPreview(args), Color3.fromRGB(0,255,100))
+                    end
+                end)
+            end
+
+            -- ОРИГИНАЛЬНЫЙ ВЫЗОВ — варарги пробрасываются напрямую,
+            -- без {...}/table.unpack, чтобы не терять nil и не ломать сигнатуру.
+            return oldNamecall(self, ...)
+        end))
+    end)
+
+    if ok then
+        hookInstalled = true
+        Log("RemoteSpy hook installed", Color3.fromRGB(0,255,200))
+    else
+        hookInstalled = false
+        Log("RemoteSpy hook FAILED: "..tostring(err), Color3.fromRGB(255,80,80))
+    end
 end
 pcall(installRemoteHook)
 
 -- ==================== INPUT DEBUG ====================
-UserInputSvc.InputBegan:Connect(function(input, gpe)
-    if not _G.BS_InputDebug_Enabled then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        Log(("[CLICK] gpe=%s pos=%d,%d"):format(
-            tostring(gpe), math.floor(input.Position.X), math.floor(input.Position.Y)),
-            Color3.fromRGB(0,200,255))
-        if gpe then
-            Log("  -> click captured by GUI (not game)!", Color3.fromRGB(255,100,100))
+pcall(function()
+    UserInputSvc.InputBegan:Connect(function(input, gpe)
+        if not _G.BS_InputDebug_Enabled then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            Log(("[CLICK] gpe=%s pos=%d,%d"):format(
+                tostring(gpe), math.floor(input.Position.X), math.floor(input.Position.Y)),
+                Color3.fromRGB(0,200,255))
+            if gpe then
+                Log("  -> click captured by GUI (not game)!", Color3.fromRGB(255,100,100))
+            end
         end
-    end
+    end)
 end)
 
 -- ==================== RAID NPC TABLE ====================
@@ -533,6 +559,11 @@ local function findToolAttackRemote(tool)
     return nil
 end
 
+-- Безопасный unpack: не теряет nil при правильно собранном массиве
+local function safeUnpack(t)
+    return table.unpack(t, 1, #t)
+end
+
 -- Приоритет 1: replay захваченного remote
 local function tryReplayCapturedRemote(mobHRP)
     local cap = _G.BloodyHub_AttackRemote
@@ -542,7 +573,8 @@ local function tryReplayCapturedRemote(mobHRP)
 
     local args = cap.args or {}
     local replayArgs = {}
-    for i, v in ipairs(args) do
+    for i = 1, #args do
+        local v = args[i]
         local tv = typeof(v)
         if tv == "Instance" and (v:IsA("BasePart") or v:IsA("Model")) and mobHRP then
             replayArgs[i] = mobHRP
@@ -555,9 +587,9 @@ local function tryReplayCapturedRemote(mobHRP)
 
     local ok = pcall(function()
         if cap.method == "FireServer" then
-            remote:FireServer(table.unpack(replayArgs))
+            remote:FireServer(safeUnpack(replayArgs))
         else
-            remote:InvokeServer(table.unpack(replayArgs))
+            remote:InvokeServer(safeUnpack(replayArgs))
         end
     end)
     return ok
@@ -808,7 +840,7 @@ local function doTalkQuest(targetName, sessionId)
                 if not npcHRP or not npcHRP.Parent then return nil end
                 return npcHRP.Position
             end, (_G.QuestForwardDist or 4) + 2,
-            function() return _G.QuestSessionId ~= sessionId end)
+                function() return _G.QuestSessionId ~= sessionId end)
         end
 
         MoveToNPC(npcHRP, { force = true })
@@ -1067,7 +1099,7 @@ local function doRaidLoop(raidName, raidSid)
                 if not npcHRP or not npcHRP.Parent then return nil end
                 return npcHRP.Position
             end, (_G.QuestForwardDist or 4) + 2,
-            function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
+                function() return _G.RaidSessionId ~= raidSid or not _G.AutoRaid_Enabled end)
         end
         MoveToNPC(npcHRP, { force = true })
         forceUnlock()
@@ -1238,10 +1270,15 @@ _G.BS_DestroyFn = function()
     end
 end
 
-LocalPlayer.Idled:Connect(function()
-    if _G.BS_Dead then return end
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
+pcall(function()
+    LocalPlayer.Idled:Connect(function()
+        if _G.BS_Dead then return end
+        if not VirtualUser then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
 end)
 
 LocalPlayer.CharacterAdded:Connect(function(char)
@@ -1308,7 +1345,7 @@ _G.BloodyHub_API = {
     end,
     StartAttackDetect = function()
         if not hookInstalled then
-            Log("Cannot detect — hookmetamethod missing", Color3.fromRGB(255,100,100))
+            Log("Cannot detect — hookmetamethod missing/failed", Color3.fromRGB(255,100,100))
             return
         end
         _G.BS_AttackDetectMode = true
@@ -1327,7 +1364,7 @@ _G.BloodyHub_API = {
     DestroySession = function() if _G.BS_DestroyFn then _G.BS_DestroyFn() end end,
 }
 
-Log("BloodyHub v4.2 LOADED (no blind Activate)", Color3.fromRGB(0,255,255))
+Log("BloodyHub v4.3 LOADED (namecall pass-through fix)", Color3.fromRGB(0,255,255))
 
 -- ==================== LOAD UI ====================
 local ok, src = pcall(function() return game:HttpGet(UI_URL, true) end)
